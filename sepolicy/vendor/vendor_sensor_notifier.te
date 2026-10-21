@@ -15,6 +15,14 @@ allow vendor_sensor_notifier touchfeature_device:chr_file rw_file_perms;
 allow vendor_sensor_notifier vendor_displayfeature_device:chr_file rw_file_perms;
 allow vendor_sensor_notifier vendor_sysfs_sensors:file r_file_perms;
 
+hal_client_domain(vendor_sensor_notifier, hal_graphics_composer)
+hal_client_domain(vendor_sensor_notifier, hal_graphics_allocator)
+allow vendor_sensor_notifier hal_display_config_hwservice:hwservice_manager find;
+allow vendor_sensor_notifier gpu_device:chr_file rw_file_perms;
+allow vendor_sensor_notifier dmabuf_system_heap_device:chr_file r_file_perms;
+
+r_dir_file(vendor_sensor_notifier, vendor_sysfs_graphics)
+
 # for libssccalapi@2.0
 allow vendor_sensor_notifier self:{ socket qipcrtr_socket} create_socket_perms;
 allowxperm vendor_sensor_notifier self:{ socket qipcrtr_socket} ioctl msm_sock_ipc_ioctls;

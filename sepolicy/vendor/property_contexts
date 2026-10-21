@@ -33,5 +33,8 @@ persist.vendor.sys.provision.status u:object_r:vendor_payment_security_prop:s0
 vendor.sys.feature_state u:object_r:vendor_payment_security_prop:s0
 vendor.sys.rpmb_state u:object_r:vendor_payment_security_prop:s0
 
+# Sensors
+ro.vendor.sensors.notifier. u:object_r:vendor_sensors_prop:s0
+
 # Thermal
 vendor.sys.thermal.data.path u:object_r:vendor_thermal_normal_prop:s0

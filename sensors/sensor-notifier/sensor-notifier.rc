@@ -7,4 +7,4 @@
 service vendor.sensor-notifier /vendor/bin/sensor-notifier
    class main
    user system
-   group system
+   group system graphics
