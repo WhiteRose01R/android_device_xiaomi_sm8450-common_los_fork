@@ -30,6 +30,7 @@ class UDalsBleedCompensator {
     void setSampledRgb(float r, float g, float b);
     bool compensate(float rawLux, float* outLux);
     bool hasSample() const;
+    uint32_t getBacklight() const;
 
   private:
     float calculateBleedLuxLocked() const;

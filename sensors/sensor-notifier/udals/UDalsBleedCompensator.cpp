@@ -178,6 +178,11 @@ bool UDalsBleedCompensator::hasSample() const {
     return mHasSample;
 }
 
+uint32_t UDalsBleedCompensator::getBacklight() const {
+    std::lock_guard<std::mutex> lock(mLock);
+    return mBacklight;
+}
+
 void UDalsBleedCompensator::setDcMode(bool dcMode) {
     std::lock_guard<std::mutex> lock(mLock);
     mDcMode = dcMode;

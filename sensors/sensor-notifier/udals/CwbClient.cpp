@@ -131,25 +131,28 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
   public:
     void NotifyCWBBufferDone(int32_t error, const native_handle_t* /* buffer */) override {
         std::lock_guard<std::mutex> lock(mMutex);
-        if (!mPending) {
+        if (!mPending || mActiveRequestId == 0) {
             return;
         }
         mError = error;
         mDone = true;
         mPending = false;
+        mActiveRequestId = 0;
         mCv.notify_all();
     }
 
-    void prepareForCapture() {
+    void prepareForCapture(uint64_t requestId) {
         std::lock_guard<std::mutex> lock(mMutex);
         mDone = false;
         mError = 0;
         mPending = true;
+        mActiveRequestId = requestId;
     }
 
     void cancelPending() {
         std::lock_guard<std::mutex> lock(mMutex);
         mPending = false;
+        mActiveRequestId = 0;
     }
 
     bool isPending() const {
@@ -183,6 +186,7 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
     void abort() {
         std::lock_guard<std::mutex> lock(mMutex);
         mAborted = true;
+        mActiveRequestId = 0;
         mCv.notify_all();
     }
 
@@ -197,6 +201,7 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
         mPending = false;
         mError = 0;
         mAborted = false;
+        mActiveRequestId = 0;
     }
 
   private:
@@ -205,6 +210,7 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
     bool mDone = false;
     bool mPending = false;
     bool mAborted = false;
+    uint64_t mActiveRequestId = 0;
     int32_t mError = 0;
 };
 
@@ -324,10 +330,8 @@ void CwbClient::releaseCwb() {
     }
     mCwbBufferHandle = nullptr;
 
-    if (mDpyConfigLib != nullptr) {
-        dlclose(mDpyConfigLib);
-        mDpyConfigLib = nullptr;
-    }
+    // Keep libdisplayconfig.qti.so mapped in the process address space during
+    // daemon lifetime so any late in-flight return paths do not execute against unmapped code.
     mDestroyFn = nullptr;
 }
 
@@ -378,7 +382,7 @@ void CwbClient::stop() {
 }
 
 bool CwbClient::requestCwbSample() {
-    if (!mRunning || mCompensator == nullptr) {
+    if (!mRunning || mCompensator == nullptr || mCompensator->getBacklight() == 0) {
         return false;
     }
 
@@ -416,7 +420,7 @@ bool CwbClient::requestCwbSample() {
                 .bottom = mRoi.bottom,
         };
 
-        mCallbackHandler->prepareForCapture();
+        mCallbackHandler->prepareForCapture(mNextRequestId++);
 
         int ret =
                 mCwbClient->SetCWBOutputBuffer(kPrimaryDisplayId, roiRect, true, mCwbBufferHandle);
@@ -509,9 +513,14 @@ void CwbClient::captureWorkerThread() {
     const auto kSampleInterval = std::chrono::milliseconds(40);
 
     while (mRunning) {
-        requestCwbSample();
+        bool sampled = requestCwbSample();
 
         auto sleepDuration = (mInitFailures >= 15) ? std::chrono::seconds(5) : kSampleInterval;
+        if (mCompensator != nullptr && mCompensator->getBacklight() == 0) {
+            sleepDuration = std::chrono::milliseconds(200);
+        } else if (!sampled && mPendingTimeouts > 0) {
+            sleepDuration = std::chrono::milliseconds(150);
+        }
 
         std::unique_lock<std::mutex> lock(mLock);
         mCv.wait_for(lock, sleepDuration, [this] { return !mRunning; });

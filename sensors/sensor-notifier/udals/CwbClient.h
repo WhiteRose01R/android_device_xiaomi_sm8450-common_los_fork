@@ -74,5 +74,6 @@ class CwbClient {
     uint32_t mInitFailures = 0;
     uint32_t mPendingTimeouts = 0;
     uint32_t mRefreshAttempts = 0;
+    uint64_t mNextRequestId = 1;
     std::chrono::steady_clock::time_point mLastInitAttempt{};
 };
