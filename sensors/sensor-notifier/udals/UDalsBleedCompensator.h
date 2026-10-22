@@ -53,4 +53,5 @@ class UDalsBleedCompensator {
     std::array<float, 5> mMedianWindow;
     size_t mMedianCount;
     size_t mMedianIndex;
+    float mLastCompensatedLux = 0.0f;
 };

@@ -39,6 +39,33 @@ std::array<float, 256> initGammaLut() {
 
 const std::array<float, 256> kGammaLut = initGammaLut();
 
+struct ScopedHardwareBufferLock {
+    ScopedHardwareBufferLock(AHardwareBuffer* buffer, uint64_t usage)
+        : mBuffer(buffer), mLocked(false), mAddr(nullptr) {
+        if (mBuffer != nullptr) {
+            int err = AHardwareBuffer_lock(mBuffer, usage, -1, nullptr, &mAddr);
+            mLocked = (err == 0 && mAddr != nullptr);
+        }
+    }
+
+    ~ScopedHardwareBufferLock() {
+        if (mLocked && mBuffer != nullptr) {
+            AHardwareBuffer_unlock(mBuffer, nullptr);
+        }
+    }
+
+    ScopedHardwareBufferLock(const ScopedHardwareBufferLock&) = delete;
+    ScopedHardwareBufferLock& operator=(const ScopedHardwareBufferLock&) = delete;
+
+    bool isLocked() const { return mLocked; }
+    void* address() const { return mAddr; }
+
+  private:
+    AHardwareBuffer* mBuffer;
+    bool mLocked;
+    void* mAddr;
+};
+
 }  // namespace
 
 namespace DisplayConfig {
@@ -129,30 +156,36 @@ class ClientInterface {
 
 class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
   public:
-    void NotifyCWBBufferDone(int32_t error, const native_handle_t* /* buffer */) override {
+    void NotifyCWBBufferDone(int32_t error, const native_handle_t* buffer) override {
         std::lock_guard<std::mutex> lock(mMutex);
         if (!mPending || mActiveRequestId == 0) {
+            return;
+        }
+        if (mExpectedBuffer != nullptr && buffer != nullptr && buffer != mExpectedBuffer) {
             return;
         }
         mError = error;
         mDone = true;
         mPending = false;
         mActiveRequestId = 0;
+        mExpectedBuffer = nullptr;
         mCv.notify_all();
     }
 
-    void prepareForCapture(uint64_t requestId) {
+    void prepareForCapture(uint64_t requestId, const native_handle_t* expectedBuffer) {
         std::lock_guard<std::mutex> lock(mMutex);
         mDone = false;
         mError = 0;
         mPending = true;
         mActiveRequestId = requestId;
+        mExpectedBuffer = expectedBuffer;
     }
 
     void cancelPending() {
         std::lock_guard<std::mutex> lock(mMutex);
         mPending = false;
         mActiveRequestId = 0;
+        mExpectedBuffer = nullptr;
     }
 
     bool isPending() const {
@@ -187,6 +220,7 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
         std::lock_guard<std::mutex> lock(mMutex);
         mAborted = true;
         mActiveRequestId = 0;
+        mExpectedBuffer = nullptr;
         mCv.notify_all();
     }
 
@@ -202,6 +236,7 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
         mError = 0;
         mAborted = false;
         mActiveRequestId = 0;
+        mExpectedBuffer = nullptr;
     }
 
   private:
@@ -211,6 +246,7 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
     bool mPending = false;
     bool mAborted = false;
     uint64_t mActiveRequestId = 0;
+    const native_handle_t* mExpectedBuffer = nullptr;
     int32_t mError = 0;
 };
 
@@ -222,7 +258,8 @@ CwbClient::CwbClient(UdalsRoi roi, std::shared_ptr<UDalsBleedCompensator> compen
       mCenterRelY(mRoiHeight / 2),
       mCompensator(std::move(compensator)),
       mRunning(false),
-      mCallbackHandler(std::make_unique<CwbCallbackHandler>()) {
+      mPaused(true),
+      mCallbackHandler(std::make_shared<CwbCallbackHandler>()) {
     int32_t maxRadius = std::min(mRoiWidth, mRoiHeight) / 2;
     mRadius1 = static_cast<int32_t>(std::lround(maxRadius * 0.38f));
     mRadius2 = static_cast<int32_t>(std::lround(maxRadius * 0.72f));
@@ -233,12 +270,28 @@ CwbClient::CwbClient(UdalsRoi roi, std::shared_ptr<UDalsBleedCompensator> compen
 }
 
 CwbClient::~CwbClient() {
-    stop();
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        mRunning = false;
+        mPaused = false;
+    }
+
+    if (mCallbackHandler != nullptr) {
+        mCallbackHandler->abort();
+    }
+
+    mCv.notify_all();
+
+    if (mWorker.joinable()) {
+        mWorker.join();
+    }
+
     releaseCwb();
 }
 
 bool CwbClient::ensureCwbInitialized() {
-    if (mCwbClient != nullptr && mCwbBufferHandle != nullptr) {
+    if (mCwbClient != nullptr && mCwbBufferHandles[0] != nullptr &&
+        mCwbBufferHandles[1] != nullptr) {
         return true;
     }
 
@@ -251,13 +304,15 @@ bool CwbClient::ensureCwbInitialized() {
     mLastInitAttempt = now;
 
     // Loaded via dlopen as libdisplayconfig.qti is a proprietary vendor library
-    mDpyConfigLib = dlopen("libdisplayconfig.qti.so", RTLD_NOW);
     if (mDpyConfigLib == nullptr) {
-        mInitFailures++;
-        LOG(WARNING) << "Failed to dlopen libdisplayconfig.qti.so: " << dlerror() << " (attempt "
-                     << mInitFailures << ")";
-        releaseCwb();
-        return false;
+        mDpyConfigLib = dlopen("libdisplayconfig.qti.so", RTLD_NOW);
+        if (mDpyConfigLib == nullptr) {
+            mInitFailures++;
+            LOG(WARNING) << "Failed to dlopen libdisplayconfig.qti.so: " << dlerror()
+                         << " (attempt " << mInitFailures << ")";
+            releaseCwb();
+            return false;
+        }
     }
 
     using CreateFn =
@@ -280,15 +335,18 @@ bool CwbClient::ensureCwbInitialized() {
     }
     mDestroyFn = destroyFn;
 
-    DisplayConfig::ClientInterface* client = nullptr;
-    if (createFn("sensor-notifier", mCallbackHandler.get(), &client) != 0 || client == nullptr) {
-        mInitFailures++;
-        LOG(WARNING) << "DisplayConfig ClientInterface Create failed"
-                     << " (attempt " << mInitFailures << ")";
-        releaseCwb();
-        return false;
+    if (mCwbClient == nullptr) {
+        DisplayConfig::ClientInterface* client = nullptr;
+        if (createFn("sensor-notifier", mCallbackHandler.get(), &client) != 0 ||
+            client == nullptr) {
+            mInitFailures++;
+            LOG(WARNING) << "DisplayConfig ClientInterface Create failed"
+                         << " (attempt " << mInitFailures << ")";
+            releaseCwb();
+            return false;
+        }
+        mCwbClient = client;
     }
-    mCwbClient = client;
 
     AHardwareBuffer_Desc desc = {
             .width = static_cast<uint32_t>(mRoiWidth),
@@ -301,20 +359,25 @@ bool CwbClient::ensureCwbInitialized() {
             .rfu1 = 0,
     };
 
-    if (AHardwareBuffer_allocate(&desc, &mCwbBuffer) != 0 || mCwbBuffer == nullptr) {
-        mInitFailures++;
-        LOG(WARNING) << "Failed to allocate CWB buffer"
-                     << " (attempt " << mInitFailures << ")";
-        releaseCwb();
-        return false;
+    for (size_t i = 0; i < kBufferCount; ++i) {
+        if (mCwbBuffers[i] == nullptr) {
+            if (AHardwareBuffer_allocate(&desc, &mCwbBuffers[i]) != 0 ||
+                mCwbBuffers[i] == nullptr) {
+                mInitFailures++;
+                LOG(WARNING) << "Failed to allocate CWB buffer " << i << " (attempt "
+                             << mInitFailures << ")";
+                releaseCwb();
+                return false;
+            }
+            AHardwareBuffer_describe(mCwbBuffers[i], &desc);
+            mCwbBufferHandles[i] = AHardwareBuffer_getNativeHandle(mCwbBuffers[i]);
+            mBufferStride = desc.stride;
+        }
     }
 
-    AHardwareBuffer_describe(mCwbBuffer, &desc);
-    mCwbBufferHandle = AHardwareBuffer_getNativeHandle(mCwbBuffer);
-    mBufferStride = desc.stride;
     mInitFailures = 0;
-    LOG(INFO) << "CwbClient initialized hardware CWB: " << mRoiWidth << "x" << mRoiHeight
-              << " RGBA, stride=" << mBufferStride;
+    LOG(INFO) << "CwbClient initialized hardware CWB double-buffer: " << mRoiWidth << "x"
+              << mRoiHeight << " RGBA, stride=" << mBufferStride;
     return true;
 }
 
@@ -324,11 +387,13 @@ void CwbClient::releaseCwb() {
         mCwbClient = nullptr;
     }
 
-    if (mCwbBuffer != nullptr) {
-        AHardwareBuffer_release(mCwbBuffer);
-        mCwbBuffer = nullptr;
+    for (size_t i = 0; i < kBufferCount; ++i) {
+        if (mCwbBuffers[i] != nullptr) {
+            AHardwareBuffer_release(mCwbBuffers[i]);
+            mCwbBuffers[i] = nullptr;
+        }
+        mCwbBufferHandles[i] = nullptr;
     }
-    mCwbBufferHandle = nullptr;
 
     // Keep libdisplayconfig.qti.so mapped in the process address space during
     // daemon lifetime so any late in-flight return paths do not execute against unmapped code.
@@ -337,56 +402,54 @@ void CwbClient::releaseCwb() {
 
 bool CwbClient::start() {
     std::lock_guard<std::mutex> lock(mLock);
-    if (mRunning) {
-        return true;
-    }
-
     if (mCallbackHandler != nullptr) {
         mCallbackHandler->forceReset();
     }
     mInitFailures = 0;
     mPendingTimeouts = 0;
     mRefreshAttempts = 0;
-    mRunning = true;
-    mWorker = std::thread(&CwbClient::captureWorkerThread, this);
+    mPaused = false;
+
+    if (!mWorker.joinable()) {
+        mRunning = true;
+        mWorker = std::thread(&CwbClient::captureWorkerThread, this);
+    } else {
+        mCv.notify_all();
+    }
     return true;
 }
 
 void CwbClient::stop() {
     {
         std::lock_guard<std::mutex> lock(mLock);
-        if (!mRunning) {
-            return;
-        }
-        mRunning = false;
+        mPaused = true;
     }
 
     if (mCallbackHandler != nullptr) {
         mCallbackHandler->abort();
-    }
-
-    mCv.notify_all();
-
-    if (mWorker.joinable()) {
-        mWorker.join();
-    }
-
-    if (mCallbackHandler != nullptr) {
         if (mCallbackHandler->isPending()) {
             mCallbackHandler->waitForDrain(std::chrono::milliseconds(80));
         }
         mCallbackHandler->forceReset();
     }
+
+    mCv.notify_all();
     mPendingTimeouts = 0;
     mRefreshAttempts = 0;
 }
 
 bool CwbClient::requestCwbSample() {
-    if (!mRunning || mCompensator == nullptr || mCompensator->getBacklight() == 0) {
+    if (!mRunning || mPaused || mCompensator == nullptr || mCompensator->getBacklight() == 0) {
         return false;
     }
 
     if (!ensureCwbInitialized()) {
+        return false;
+    }
+
+    size_t submitIdx = mCurrentBufferIndex;
+    const struct native_handle* submitHandle = mCwbBufferHandles[submitIdx];
+    if (submitHandle == nullptr) {
         return false;
     }
 
@@ -399,7 +462,7 @@ bool CwbClient::requestCwbSample() {
             mPendingTimeouts = 0;
         } else {
             if (++mPendingTimeouts < 5) {
-                if (mRunning && !mCompensator->hasSample() && mRefreshAttempts < 3) {
+                if (mRunning && !mPaused && !mCompensator->hasSample() && mRefreshAttempts < 3) {
                     mCwbClient->RefreshScreen();
                     mRefreshAttempts++;
                 }
@@ -420,16 +483,15 @@ bool CwbClient::requestCwbSample() {
                 .bottom = mRoi.bottom,
         };
 
-        mCallbackHandler->prepareForCapture(mNextRequestId++);
+        mCallbackHandler->prepareForCapture(mNextRequestId++, submitHandle);
 
-        int ret =
-                mCwbClient->SetCWBOutputBuffer(kPrimaryDisplayId, roiRect, true, mCwbBufferHandle);
+        int ret = mCwbClient->SetCWBOutputBuffer(kPrimaryDisplayId, roiRect, true, submitHandle);
         if (ret != 0) {
             mCallbackHandler->cancelPending();
             return false;
         }
 
-        if (mRunning && !mCompensator->hasSample() && mRefreshAttempts < 3) {
+        if (mRunning && !mPaused && !mCompensator->hasSample() && mRefreshAttempts < 3) {
             mCwbClient->RefreshScreen();
             mRefreshAttempts++;
         }
@@ -446,14 +508,13 @@ bool CwbClient::requestCwbSample() {
     }
     mPendingTimeouts = 0;
 
-    void* vaddr = nullptr;
-    if (AHardwareBuffer_lock(mCwbBuffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN, -1, nullptr,
-                             &vaddr) != 0 ||
-        vaddr == nullptr) {
+    AHardwareBuffer* currentBuffer = mCwbBuffers[submitIdx];
+    ScopedHardwareBufferLock scopedLock(currentBuffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN);
+    if (!scopedLock.isLocked()) {
         return false;
     }
 
-    const uint8_t* pixels = static_cast<const uint8_t*>(vaddr);
+    const uint8_t* pixels = static_cast<const uint8_t*>(scopedLock.address());
     float weightedR = 0.0f;
     float weightedG = 0.0f;
     float weightedB = 0.0f;
@@ -493,7 +554,8 @@ bool CwbClient::requestCwbSample() {
         }
     }
 
-    AHardwareBuffer_unlock(mCwbBuffer, nullptr);
+    // Toggle double-buffer index for the next capture
+    mCurrentBufferIndex = (submitIdx + 1) % kBufferCount;
 
     if (totalWeight > 0.0f) {
         float normR = std::clamp(weightedR / totalWeight, 0.0f, 1.0f);
@@ -513,6 +575,14 @@ void CwbClient::captureWorkerThread() {
     const auto kSampleInterval = std::chrono::milliseconds(40);
 
     while (mRunning) {
+        {
+            std::unique_lock<std::mutex> lock(mLock);
+            mCv.wait(lock, [this] { return !mRunning || !mPaused; });
+            if (!mRunning) {
+                break;
+            }
+        }
+
         bool sampled = requestCwbSample();
 
         auto sleepDuration = (mInitFailures >= 15) ? std::chrono::seconds(5) : kSampleInterval;
@@ -523,6 +593,6 @@ void CwbClient::captureWorkerThread() {
         }
 
         std::unique_lock<std::mutex> lock(mLock);
-        mCv.wait_for(lock, sleepDuration, [this] { return !mRunning; });
+        mCv.wait_for(lock, sleepDuration, [this] { return !mRunning || mPaused; });
     }
 }

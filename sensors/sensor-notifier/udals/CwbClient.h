@@ -33,6 +33,8 @@ struct UdalsRoi {
 
 class CwbClient {
   public:
+    static constexpr size_t kBufferCount = 2;
+
     CwbClient(UdalsRoi roi, std::shared_ptr<UDalsBleedCompensator> compensator);
     ~CwbClient();
 
@@ -59,6 +61,7 @@ class CwbClient {
 
     std::shared_ptr<UDalsBleedCompensator> mCompensator;
     std::atomic<bool> mRunning;
+    std::atomic<bool> mPaused;
     std::thread mWorker;
 
     std::mutex mLock;
@@ -66,10 +69,11 @@ class CwbClient {
 
     void* mDpyConfigLib = nullptr;
     DisplayConfig::ClientInterface* mCwbClient = nullptr;
-    std::unique_ptr<CwbCallbackHandler> mCallbackHandler;
+    std::shared_ptr<CwbCallbackHandler> mCallbackHandler;
     void (*mDestroyFn)(DisplayConfig::ClientInterface*) = nullptr;
-    AHardwareBuffer* mCwbBuffer = nullptr;
-    const struct native_handle* mCwbBufferHandle = nullptr;
+    AHardwareBuffer* mCwbBuffers[kBufferCount] = {nullptr, nullptr};
+    const struct native_handle* mCwbBufferHandles[kBufferCount] = {nullptr, nullptr};
+    size_t mCurrentBufferIndex = 0;
     uint32_t mBufferStride = 0;
     uint32_t mInitFailures = 0;
     uint32_t mPendingTimeouts = 0;
