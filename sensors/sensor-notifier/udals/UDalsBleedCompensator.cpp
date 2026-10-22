@@ -267,14 +267,9 @@ bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::steady_clock::now() - mResetTime)
                                .count();
-        if (elapsed < 300) {
+        if (elapsed < 150) {
             return false;
         }
-        if (mLastCompensatedLux > 0.0f) {
-            *outLux = mLastCompensatedLux;
-            return true;
-        }
-        return false;
     }
 
     float bleed = calculateBleedLuxLocked();
@@ -290,6 +285,5 @@ bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
     size_t medianIdx = (mMedianCount - 1) / 2;
     std::nth_element(temp.begin(), temp.begin() + medianIdx, temp.begin() + mMedianCount);
     *outLux = temp[medianIdx];
-    mLastCompensatedLux = *outLux;
     return true;
 }

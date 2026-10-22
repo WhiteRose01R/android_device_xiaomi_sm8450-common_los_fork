@@ -156,36 +156,30 @@ class ClientInterface {
 
 class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
   public:
-    void NotifyCWBBufferDone(int32_t error, const native_handle_t* buffer) override {
+    void NotifyCWBBufferDone(int32_t error, const native_handle_t* /* buffer */) override {
         std::lock_guard<std::mutex> lock(mMutex);
         if (!mPending || mActiveRequestId == 0) {
-            return;
-        }
-        if (mExpectedBuffer != nullptr && buffer != nullptr && buffer != mExpectedBuffer) {
             return;
         }
         mError = error;
         mDone = true;
         mPending = false;
         mActiveRequestId = 0;
-        mExpectedBuffer = nullptr;
         mCv.notify_all();
     }
 
-    void prepareForCapture(uint64_t requestId, const native_handle_t* expectedBuffer) {
+    void prepareForCapture(uint64_t requestId) {
         std::lock_guard<std::mutex> lock(mMutex);
         mDone = false;
         mError = 0;
         mPending = true;
         mActiveRequestId = requestId;
-        mExpectedBuffer = expectedBuffer;
     }
 
     void cancelPending() {
         std::lock_guard<std::mutex> lock(mMutex);
         mPending = false;
         mActiveRequestId = 0;
-        mExpectedBuffer = nullptr;
     }
 
     bool isPending() const {
@@ -219,8 +213,6 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
     void abort() {
         std::lock_guard<std::mutex> lock(mMutex);
         mAborted = true;
-        mActiveRequestId = 0;
-        mExpectedBuffer = nullptr;
         mCv.notify_all();
     }
 
@@ -236,7 +228,6 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
         mError = 0;
         mAborted = false;
         mActiveRequestId = 0;
-        mExpectedBuffer = nullptr;
     }
 
   private:
@@ -246,7 +237,6 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
     bool mPending = false;
     bool mAborted = false;
     uint64_t mActiveRequestId = 0;
-    const native_handle_t* mExpectedBuffer = nullptr;
     int32_t mError = 0;
 };
 
@@ -483,7 +473,7 @@ bool CwbClient::requestCwbSample() {
                 .bottom = mRoi.bottom,
         };
 
-        mCallbackHandler->prepareForCapture(mNextRequestId++, submitHandle);
+        mCallbackHandler->prepareForCapture(mNextRequestId++);
 
         int ret = mCwbClient->SetCWBOutputBuffer(kPrimaryDisplayId, roiRect, true, submitHandle);
         if (ret != 0) {
