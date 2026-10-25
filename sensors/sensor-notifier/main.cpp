@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 The LineageOS Project
+ * Copyright (C) 2024-2026 The LineageOS Project
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -9,6 +9,7 @@
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 
+#include "SensorNotifierExt.h"
 #include "SscCalApi.h"
 #include "notifiers/AodNotifier.h"
 #include "notifiers/LightNotifier.h"
@@ -31,6 +32,12 @@ int main() {
     notifiers.push_back(std::make_unique<NonUiNotifier>(manager));
     notifiers.push_back(std::make_unique<RawLightNotifier>(manager));
     for (const auto& notifier : notifiers) {
+        notifier->activate();
+    }
+
+    std::unique_ptr<SensorNotifierExt> sensorNotifierExt =
+            std::make_unique<SensorNotifierExt>(manager);
+    for (const auto& notifier : sensorNotifierExt->mNotifiers) {
         notifier->activate();
     }
 

@@ -10,7 +10,7 @@
 
 #include <android-base/logging.h>
 #include <android/hardware_buffer.h>
-#include <dlfcn.h>
+#include <display_config.h>
 #include <pthread.h>
 #include <vndk/hardware_buffer.h>
 
@@ -67,92 +67,6 @@ struct ScopedHardwareBufferLock {
 };
 
 }  // namespace
-
-namespace DisplayConfig {
-
-enum class DisplayType {
-    kInvalid = -1,
-    kPrimary = 0,
-    kExternal = 1,
-    kVirtual = 2,
-    kBuiltIn2 = 3,
-};
-
-enum class ExternalStatus {
-    kOffline = 0,
-    kOnline = 1,
-    kPause = 2,
-    kResume = 3,
-};
-
-enum class DynRefreshRateOp {
-    kDisableMetadata = 0,
-    kEnableMetadata = 1,
-    kSetFps = 2,
-};
-
-struct Rect {
-    int left = 0;
-    int top = 0;
-    int right = 0;
-    int bottom = 0;
-};
-
-class ConfigCallback {
-  public:
-    virtual void NotifyCWBBufferDone(int32_t error, const native_handle_t* buffer) = 0;
-    virtual void NotifyQsyncChange(bool, int32_t, int32_t) {}
-    virtual void NotifyIdleStatus(bool) {}
-    virtual ~ConfigCallback() = default;
-};
-
-class ClientInterface {
-  public:
-    virtual int IsDisplayConnected(DisplayType type, bool* connected) = 0;
-    virtual int SetDisplayStatus(DisplayType type, ExternalStatus status) = 0;
-    virtual int ConfigureDynRefreshRate(DynRefreshRateOp op, uint32_t hz) = 0;
-    virtual int GetConfigCount(DisplayType type, uint32_t* count) = 0;
-    virtual int GetActiveConfig(DisplayType type, uint32_t* index) = 0;
-    virtual int SetActiveConfig(DisplayType type, uint32_t index) = 0;
-    virtual int GetDisplayAttributes(uint32_t index, DisplayType type, void* attr) = 0;
-    virtual int SetPanelBrightness(uint32_t level) = 0;
-    virtual int GetPanelBrightness(uint32_t* level) = 0;
-    virtual int MinHdcpEncryptionLevelChanged(DisplayType type, uint32_t min_enc_level) = 0;
-    virtual int RefreshScreen() = 0;
-    virtual int ControlPartialUpdate(DisplayType type, bool enable) = 0;
-    virtual int ToggleScreenUpdate(bool on) = 0;
-    virtual int SetIdleTimeout(uint32_t value) = 0;
-    virtual int GetHDRCapabilities(DisplayType type, void* caps) = 0;
-    virtual int SetCameraLaunchStatus(uint32_t on) = 0;
-    virtual ~ClientInterface() = default;
-    virtual int DisplayBWTransactionPending(bool* status) = 0;
-    virtual int SetDisplayAnimating(uint64_t display_id, bool animating) = 0;
-    virtual int ControlIdlePowerCollapse(bool enable, bool synchronous) = 0;
-    virtual int GetWriteBackCapabilities(bool* status) = 0;
-    virtual int SetDisplayDppsAdROI(uint32_t display_id, uint32_t h_start, uint32_t h_end,
-                                    uint32_t v_start, uint32_t v_end, uint32_t factor_in,
-                                    uint32_t factor_out) = 0;
-    virtual int UpdateVSyncSourceOnPowerModeOff() = 0;
-    virtual int UpdateVSyncSourceOnPowerModeDoze() = 0;
-    virtual int SetPowerMode(uint32_t display_id, uint32_t power_mode) = 0;
-    virtual int IsPowerModeOverrideSupported(uint32_t display_id, bool* supported) = 0;
-    virtual int IsHDRSupported(uint32_t display_id, bool* supported) = 0;
-    virtual int IsWCGSupported(uint32_t display_id, bool* supported) = 0;
-    virtual int SetLayerAsMask(uint32_t display_id, uint64_t layer_id) = 0;
-    virtual int GetDebugProperty(std::string prop_name, std::string* value) = 0;
-    virtual int GetActiveBuiltinDisplayAttributes(void* attr) = 0;
-    virtual int SetPanelLuminanceAttributes(uint32_t display_id, float min_lum, float max_lum) = 0;
-    virtual int IsBuiltInDisplay(uint32_t display_id, bool* is_builtin) = 0;
-    virtual int IsAsyncVDSCreationSupported(bool* supported) = 0;
-    virtual int CreateVirtualDisplay(uint32_t width, uint32_t height, int format) = 0;
-    virtual int GetSupportedDSIBitClks(uint32_t display_id, std::vector<uint64_t>* bit_clks) = 0;
-    virtual int GetDSIClk(uint32_t display_id, uint64_t* bit_clk) = 0;
-    virtual int SetDSIClk(uint32_t display_id, uint64_t bit_clk) = 0;
-    virtual int SetCWBOutputBuffer(uint32_t display_id, Rect rect, bool dither,
-                                   const native_handle_t* buffer) = 0;
-};
-
-}  // namespace DisplayConfig
 
 class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
   public:
@@ -293,45 +207,14 @@ bool CwbClient::ensureCwbInitialized() {
     }
     mLastInitAttempt = now;
 
-    // Loaded via dlopen as libdisplayconfig.qti is a proprietary vendor library
-    if (mDpyConfigLib == nullptr) {
-        mDpyConfigLib = dlopen("libdisplayconfig.qti.so", RTLD_NOW);
-        if (mDpyConfigLib == nullptr) {
-            mInitFailures++;
-            LOG(WARNING) << "Failed to dlopen libdisplayconfig.qti.so: " << dlerror()
-                         << " (attempt " << mInitFailures << ")";
-            releaseCwb();
-            return false;
-        }
-    }
-
-    using CreateFn =
-            int (*)(std::string, DisplayConfig::ConfigCallback*, DisplayConfig::ClientInterface**);
-    using DestroyFn = void (*)(DisplayConfig::ClientInterface*);
-
-    auto createFn = reinterpret_cast<CreateFn>(
-            dlsym(mDpyConfigLib,
-                  "_ZN13DisplayConfig15ClientInterface6CreateENSt3__112basic_stringIcNS1_11char_"
-                  "traitsIcEENS1_9allocatorIcEEEEPNS_14ConfigCallbackEPPS0_"));
-    auto destroyFn = reinterpret_cast<DestroyFn>(
-            dlsym(mDpyConfigLib, "_ZN13DisplayConfig15ClientInterface7DestroyEPS0_"));
-
-    if (createFn == nullptr || destroyFn == nullptr) {
-        mInitFailures++;
-        LOG(WARNING) << "Failed to find DisplayConfig ClientInterface symbols"
-                     << " (attempt " << mInitFailures << ")";
-        releaseCwb();
-        return false;
-    }
-    mDestroyFn = destroyFn;
-
     if (mCwbClient == nullptr) {
         DisplayConfig::ClientInterface* client = nullptr;
-        if (createFn("sensor-notifier", mCallbackHandler.get(), &client) != 0 ||
+        if (DisplayConfig::ClientInterface::Create("sensor-notifier", mCallbackHandler.get(),
+                                                   &client) != 0 ||
             client == nullptr) {
             mInitFailures++;
-            LOG(WARNING) << "DisplayConfig ClientInterface Create failed"
-                         << " (attempt " << mInitFailures << ")";
+            LOG(WARNING) << "DisplayConfig ClientInterface Create failed (attempt " << mInitFailures
+                         << ")";
             releaseCwb();
             return false;
         }
@@ -372,8 +255,8 @@ bool CwbClient::ensureCwbInitialized() {
 }
 
 void CwbClient::releaseCwb() {
-    if (mCwbClient != nullptr && mDestroyFn != nullptr) {
-        mDestroyFn(mCwbClient);
+    if (mCwbClient != nullptr) {
+        DisplayConfig::ClientInterface::Destroy(mCwbClient);
         mCwbClient = nullptr;
     }
 
@@ -384,10 +267,6 @@ void CwbClient::releaseCwb() {
         }
         mCwbBufferHandles[i] = nullptr;
     }
-
-    // Keep libdisplayconfig.qti.so mapped in the process address space during
-    // daemon lifetime so any late in-flight return paths do not execute against unmapped code.
-    mDestroyFn = nullptr;
 }
 
 bool CwbClient::start() {

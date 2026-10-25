@@ -67,10 +67,8 @@ class CwbClient {
     std::mutex mLock;
     std::condition_variable mCv;
 
-    void* mDpyConfigLib = nullptr;
     DisplayConfig::ClientInterface* mCwbClient = nullptr;
     std::shared_ptr<CwbCallbackHandler> mCallbackHandler;
-    void (*mDestroyFn)(DisplayConfig::ClientInterface*) = nullptr;
     AHardwareBuffer* mCwbBuffers[kBufferCount] = {nullptr, nullptr};
     const struct native_handle* mCwbBufferHandles[kBufferCount] = {nullptr, nullptr};
     size_t mCurrentBufferIndex = 0;
