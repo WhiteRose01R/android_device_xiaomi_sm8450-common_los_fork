@@ -226,7 +226,8 @@ bool CwbClient::ensureCwbInitialized() {
             .height = static_cast<uint32_t>(mRoiHeight),
             .layers = 1,
             .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
-            .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT,
+            .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
+                     AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
             .stride = 0,
             .rfu0 = 0,
             .rfu1 = 0,
@@ -454,8 +455,10 @@ void CwbClient::captureWorkerThread() {
 
         bool sampled = requestCwbSample();
 
-        auto sleepDuration = (mInitFailures >= 15) ? std::chrono::seconds(5) : kSampleInterval;
-        if (mCompensator != nullptr && mCompensator->getBacklight() == 0) {
+        auto sleepDuration = kSampleInterval;
+        if (mInitFailures >= 15) {
+            sleepDuration = std::chrono::seconds(5);
+        } else if (mCompensator != nullptr && mCompensator->getBacklight() == 0) {
             sleepDuration = std::chrono::milliseconds(200);
         } else if (!sampled && mPendingTimeouts > 0) {
             sleepDuration = std::chrono::milliseconds(150);
