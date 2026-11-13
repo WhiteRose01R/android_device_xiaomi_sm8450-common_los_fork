@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2024 The LineageOS Project
+// Copyright (C) 2024, 2026 The LineageOS Project
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -20,6 +20,7 @@ cc_binary {
         "main.cpp",
         "notifiers/LightNotifier.cpp",
         "notifiers/NonUiNotifier.cpp",
+        "notifiers/RawLightNotifier.cpp",
         "SensorNotifier.cpp",
         "utils/SensorNotifierUtils.cpp",
         "utils/SscCalApiWrapper.cpp",

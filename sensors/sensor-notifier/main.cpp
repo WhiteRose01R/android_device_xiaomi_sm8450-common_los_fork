@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 The LineageOS Project
+ * Copyright (C) 2024, 2026 The LineageOS Project
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -13,6 +13,7 @@
 #include "SscCalApi.h"
 #include "notifiers/LightNotifier.h"
 #include "notifiers/NonUiNotifier.h"
+#include "notifiers/RawLightNotifier.h"
 
 int main() {
     sp<ISensorManager> manager = ISensorManager::getService();
@@ -27,6 +28,9 @@ int main() {
     std::vector<std::unique_ptr<SensorNotifier>> notifiers;
     notifiers.push_back(std::make_unique<LightNotifier>(manager));
     notifiers.push_back(std::make_unique<NonUiNotifier>(manager));
+    if (android::base::GetBoolProperty("ro.vendor.sensors.notifier.raw_light.enable", false)) {
+        notifiers.push_back(std::make_unique<RawLightNotifier>(manager));
+    }
     for (const auto& notifier : notifiers) {
         notifier->activate();
     }
