@@ -10,6 +10,9 @@
 
 #include <android-base/logging.h>
 #include <dlfcn.h>
+#include <mutex>
+
+static std::mutex gSscMsgMutex;
 
 SscCalApiWrapper::SscCalApiWrapper() {
     mSscCalApiHandle = dlopen("libssccalapi@2.0.so", RTLD_NOW);
@@ -30,7 +33,13 @@ SscCalApiWrapper::SscCalApiWrapper() {
 }
 
 SscCalApiWrapper::~SscCalApiWrapper() {
-    dlclose(mSscCalApiHandle);
+    std::lock_guard<std::mutex> lock(gSscMsgMutex);
+    init_current_sensors = NULL;
+    process_msg = NULL;
+    if (mSscCalApiHandle != nullptr) {
+        dlclose(mSscCalApiHandle);
+        mSscCalApiHandle = nullptr;
+    }
 }
 
 SscCalApiWrapper& SscCalApiWrapper::getInstance() {
@@ -45,6 +54,7 @@ void SscCalApiWrapper::initCurrentSensors(bool debug) {
 }
 
 void SscCalApiWrapper::processMsg(_oem_msg* msg) {
+    std::lock_guard<std::mutex> lock(gSscMsgMutex);
     if (process_msg != NULL) {
         LOG(DEBUG) << "sending oem_msg for sensor " << msg->sensorType
                    << " with type: " << msg->notifyType << " and value: " << msg->value;

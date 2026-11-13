@@ -65,7 +65,7 @@ Result SensorNotifier::initializeSensorQueue(std::string typeAsString, bool wake
 }
 
 void SensorNotifier::activate() {
-    if (mActive) {
+    if (mActive || mThread.joinable()) {
         return;
     }
     mActive = true;
@@ -73,14 +73,14 @@ void SensorNotifier::activate() {
 }
 
 void SensorNotifier::deactivate() {
-    if (!mActive) {
-        return;
-    }
     mActive = false;
     if (mThread.joinable()) {
         mThread.join();
     }
-    if (mQueue != nullptr) {
-        mQueue->disableSensor(mSensorHandle);
+    if (mQueue != nullptr && mSensorHandle >= 0) {
+        auto res = mQueue->disableSensor(mSensorHandle);
+        if (!res.isOk()) {
+            LOG(ERROR) << "failed to disable sensor: transport error";
+        }
     }
 }

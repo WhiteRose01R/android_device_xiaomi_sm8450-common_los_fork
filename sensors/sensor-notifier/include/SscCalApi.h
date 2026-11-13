@@ -42,7 +42,7 @@ class SscCalApiWrapper {
     SscCalApiWrapper();
     ~SscCalApiWrapper();
 
-    void* mSscCalApiHandle;
-    process_msg_t process_msg;
-    init_current_sensors_t init_current_sensors;
+    void* mSscCalApiHandle = nullptr;
+    process_msg_t process_msg = nullptr;
+    init_current_sensors_t init_current_sensors = nullptr;
 };
