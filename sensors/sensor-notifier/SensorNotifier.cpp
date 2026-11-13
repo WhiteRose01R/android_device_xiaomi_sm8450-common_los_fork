@@ -65,7 +65,7 @@ Result SensorNotifier::initializeSensorQueue(std::string typeAsString, bool wake
 }
 
 void SensorNotifier::activate() {
-    if (mActive) {
+    if (mActive || mThread.joinable()) {
         return;
     }
     mActive = true;
@@ -73,14 +73,11 @@ void SensorNotifier::activate() {
 }
 
 void SensorNotifier::deactivate() {
-    if (!mActive) {
-        return;
-    }
     mActive = false;
     if (mThread.joinable()) {
         mThread.join();
     }
-    if (mQueue != nullptr) {
+    if (mQueue != nullptr && mSensorHandle >= 0) {
         mQueue->disableSensor(mSensorHandle);
     }
 }
