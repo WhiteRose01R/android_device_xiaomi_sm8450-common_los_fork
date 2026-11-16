@@ -7,8 +7,11 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 
 #include "SensorNotifier.h"
+#include "udals/CwbClient.h"
+#include "udals/UDalsBleedCompensator.h"
 
 class RawLightNotifier : public SensorNotifier {
   public:
@@ -19,5 +22,16 @@ class RawLightNotifier : public SensorNotifier {
     void notify() override;
 
   private:
+    void applyNormalizedBacklight(uint32_t normalized);
+    uint32_t normalizeBacklight(uint32_t raw) const;
+    void resolveBacklightScale();
+    void updateBacklight(uint32_t rawBacklight);
+    bool setSensorEnabled(bool enable);
+    void syncCompensatorDisplayState(int dbvFd);
+
     std::atomic<bool> mEnabled;
+    bool mBacklightScaleResolved;
+    uint32_t mDeviceNormalMaxBacklight;
+    std::shared_ptr<UDalsBleedCompensator> mCompensator;
+    std::unique_ptr<CwbClient> mCwbClient;
 };
