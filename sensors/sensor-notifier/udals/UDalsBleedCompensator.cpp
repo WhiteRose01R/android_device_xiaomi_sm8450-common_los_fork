@@ -23,7 +23,6 @@
 UDalsBleedCompensator::UDalsBleedCompensator()
     : mBacklight(0),
       mNormalMaxBacklight(2047u),
-      mHbmMode(false),
       mHasSample(false),
       mWakeGateActive(false),
       mNormR(0.0f),
@@ -183,7 +182,6 @@ void UDalsBleedCompensator::reset() {
     mMedianCount = 0;
     mMedianIndex = 0;
     mBacklight = 0;
-    mHbmMode = false;
     mHasSample = false;
     mWakeGateActive = true;
     mNormR = 0.0f;
@@ -195,7 +193,7 @@ void UDalsBleedCompensator::reset() {
 
 void UDalsBleedCompensator::setBacklight(uint32_t brightness) {
     std::lock_guard<std::mutex> lock(mLock);
-    mBacklight = std::min(brightness, mNormalMaxBacklight);
+    mBacklight = brightness;
 }
 
 bool UDalsBleedCompensator::hasSample() const {
@@ -211,11 +209,6 @@ uint32_t UDalsBleedCompensator::getBacklight() const {
 uint32_t UDalsBleedCompensator::getNormalMaxBacklight() const {
     std::lock_guard<std::mutex> lock(mLock);
     return mNormalMaxBacklight;
-}
-
-void UDalsBleedCompensator::setHbmMode(bool hbm) {
-    std::lock_guard<std::mutex> lock(mLock);
-    mHbmMode = hbm;
 }
 
 void UDalsBleedCompensator::setSampledRgb(float r, float g, float b) {
@@ -278,9 +271,6 @@ float UDalsBleedCompensator::calculateBleedLuxLocked() const {
         stalenessFactor = 1.0f - static_cast<float>(ageMs - 1500) / 5000.0f;
     }
 
-    // Calibration tables and max_bleed_rgb are characterized up to mNormalMaxBacklight
-    uint32_t effectiveBacklight = mHbmMode ? mNormalMaxBacklight : mBacklight;
-
     if (mNormR <= 0.001f && mNormG <= 0.001f && mNormB <= 0.001f) {
         return 0.0f;
     }
@@ -293,16 +283,24 @@ float UDalsBleedCompensator::calculateBleedLuxLocked() const {
     float maxClearG = mNormalDataG.back().clear;
     float maxClearB = mNormalDataB.back().clear;
 
-    float clearAtBrightnessR =
-            interpolateTable(mNormalDataR, static_cast<float>(effectiveBacklight));
-    float clearAtBrightnessG =
-            interpolateTable(mNormalDataG, static_cast<float>(effectiveBacklight));
-    float clearAtBrightnessB =
-            interpolateTable(mNormalDataB, static_cast<float>(effectiveBacklight));
+    float curveR = 0.0f;
+    float curveG = 0.0f;
+    float curveB = 0.0f;
+    if (mNormalMaxBacklight > 0 && mBacklight > mNormalMaxBacklight) {
+        float hbmScale = std::min(
+                static_cast<float>(mBacklight) / static_cast<float>(mNormalMaxBacklight), 3.0f);
+        curveR = (maxClearR > 0.0f) ? hbmScale : 0.0f;
+        curveG = (maxClearG > 0.0f) ? hbmScale : 0.0f;
+        curveB = (maxClearB > 0.0f) ? hbmScale : 0.0f;
+    } else {
+        float clearAtBrightnessR = interpolateTable(mNormalDataR, static_cast<float>(mBacklight));
+        float clearAtBrightnessG = interpolateTable(mNormalDataG, static_cast<float>(mBacklight));
+        float clearAtBrightnessB = interpolateTable(mNormalDataB, static_cast<float>(mBacklight));
 
-    float curveR = (maxClearR > 0.0f) ? (clearAtBrightnessR / maxClearR) : 0.0f;
-    float curveG = (maxClearG > 0.0f) ? (clearAtBrightnessG / maxClearG) : 0.0f;
-    float curveB = (maxClearB > 0.0f) ? (clearAtBrightnessB / maxClearB) : 0.0f;
+        curveR = (maxClearR > 0.0f) ? (clearAtBrightnessR / maxClearR) : 0.0f;
+        curveG = (maxClearG > 0.0f) ? (clearAtBrightnessG / maxClearG) : 0.0f;
+        curveB = (maxClearB > 0.0f) ? (clearAtBrightnessB / maxClearB) : 0.0f;
+    }
 
     float bleedR = mNormR * curveR * mPeakBleedLuxRed;
     float bleedG = mNormG * curveG * mPeakBleedLuxGreen;

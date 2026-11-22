@@ -39,7 +39,6 @@ class UDalsBleedCompensator {
 
     void reset();
     void setBacklight(uint32_t brightness);
-    void setHbmMode(bool hbm);
     void setSampledRgb(float r, float g, float b);
     bool compensate(float rawLux, float* outLux);
     bool hasSample() const;
@@ -53,7 +52,6 @@ class UDalsBleedCompensator {
     mutable std::mutex mLock;
     uint32_t mBacklight;
     uint32_t mNormalMaxBacklight;
-    bool mHbmMode;
     bool mHasSample;
     bool mWakeGateActive;
     float mNormR;

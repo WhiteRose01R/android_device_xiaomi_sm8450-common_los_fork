@@ -144,10 +144,6 @@ void RawLightNotifier::updateBacklight(uint32_t rawBacklight) {
     if (mCompensator == nullptr) {
         return;
     }
-    uint32_t normalMax = (mDeviceNormalMaxBacklight > 0)
-                                 ? mDeviceNormalMaxBacklight
-                                 : mCompensator->getNormalMaxBacklight();
-    mCompensator->setHbmMode(normalMax > 0 && rawBacklight > normalMax);
     applyNormalizedBacklight(normalizeBacklight(rawBacklight));
 }
 
