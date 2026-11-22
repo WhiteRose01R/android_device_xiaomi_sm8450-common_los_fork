@@ -290,7 +290,6 @@ void RawLightNotifier::notify() {
         if (displayOn) {
             return;
         }
-        displayOn = true;
         if (mCompensator != nullptr) {
             mCompensator->reset();
             if (initialRawBkl != nullptr) {
@@ -301,7 +300,11 @@ void RawLightNotifier::notify() {
                 syncCompensatorDisplayState(disp_fd_.get());
             }
         }
-        if (setSensorEnabled(true) && mActive && mCwbClient != nullptr) {
+        if (!setSensorEnabled(true)) {
+            return;
+        }
+        displayOn = true;
+        if (mActive && mCwbClient != nullptr) {
             mCwbClient->start();
         }
     };

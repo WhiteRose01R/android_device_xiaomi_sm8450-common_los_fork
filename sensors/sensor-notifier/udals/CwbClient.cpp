@@ -234,7 +234,8 @@ bool CwbClient::isActiveGen(uint64_t gen) const {
 
 void CwbClient::notifyBacklightChanged() {
     std::lock_guard<std::mutex> lock(mControlMutex);
-    if (mRunning && !mPaused && (mCaptureRequested || mInLockout) && hasActiveBacklight()) {
+    if (mRunning && !mPaused && !mAboveBleedRelevantLux && (mCaptureRequested || mInLockout) &&
+        hasActiveBacklight()) {
         mCv.notify_all();
     }
 }
@@ -251,29 +252,33 @@ void CwbClient::onRawLuxSample(float rawLux) {
             return;
         }
         if (rawLux >= kMaxBleedRelevantLux) {
+            bool changed = !mAboveBleedRelevantLux;
+            mAboveBleedRelevantLux = true;
             mHasLatestRawLux = false;
             mHasRawLuxAnchor = false;
             mSeedAnchorOnNextSample = false;
             mCaptureRequested = false;
-            return;
-        }
-        mLatestRawLux = rawLux;
-        mHasLatestRawLux = true;
-        if (mInLockout) {
-            return;
-        }
-        if (mSeedAnchorOnNextSample) {
-            mLastTriggerRawLux = rawLux;
-            mHasRawLuxAnchor = true;
-            mSeedAnchorOnNextSample = false;
-            return;
-        }
-        float threshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
-                                     kMinTriggerDeltaLux, kMaxTriggerDeltaLux);
-        if (!mHasRawLuxAnchor || std::fabs(rawLux - mLastTriggerRawLux) >= threshold) {
-            if (!mCaptureRequested) {
-                mCaptureRequested = true;
-                shouldNotify = true;
+            shouldNotify = changed;
+        } else {
+            bool resumedFromHighLux = mAboveBleedRelevantLux;
+            mAboveBleedRelevantLux = false;
+            mLatestRawLux = rawLux;
+            mHasLatestRawLux = true;
+            if (mInLockout) {
+                shouldNotify = resumedFromHighLux;
+            } else if (mSeedAnchorOnNextSample) {
+                mLastTriggerRawLux = rawLux;
+                mHasRawLuxAnchor = true;
+                mSeedAnchorOnNextSample = false;
+            } else {
+                float threshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
+                                             kMinTriggerDeltaLux, kMaxTriggerDeltaLux);
+                if (!mHasRawLuxAnchor || std::fabs(rawLux - mLastTriggerRawLux) >= threshold) {
+                    if (!mCaptureRequested) {
+                        mCaptureRequested = true;
+                        shouldNotify = true;
+                    }
+                }
             }
         }
     }
@@ -313,9 +318,8 @@ bool CwbClient::ensureCwbInitializedWorker() {
     }
 
     auto now = std::chrono::steady_clock::now();
-    auto minInterval = (mInitFailures >= 15) ? std::chrono::seconds(5) : std::chrono::seconds(1);
-    if (mInitFailures > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     now - mLastInitAttempt) < minInterval) {
+    if (mInitFailures >= 15 && std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       now - mLastInitAttempt) < std::chrono::seconds(5)) {
         return false;
     }
     mLastInitAttempt = now;
@@ -449,6 +453,7 @@ bool CwbClient::start() {
         gen = ++mCaptureGen;
         mPaused = false;
         mInLockout = false;
+        mAboveBleedRelevantLux = false;
         mHasLatestRawLux = false;
         mLatestRawLux = 0.0f;
         mHasRawLuxAnchor = false;
@@ -479,6 +484,7 @@ void CwbClient::stop() {
         mPaused = true;
         mCaptureRequested = false;
         mInLockout = false;
+        mAboveBleedRelevantLux = false;
         mHasLatestRawLux = false;
         mLatestRawLux = 0.0f;
         mHasRawLuxAnchor = false;
@@ -547,7 +553,7 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
     {
         std::lock_guard<std::mutex> lock(mControlMutex);
         if (!mRunning || mPaused || mCaptureGen != currentGen || mCompensator == nullptr ||
-            !hasActiveBacklight()) {
+            mAboveBleedRelevantLux || !hasActiveBacklight()) {
             return CaptureResult::kAborted;
         }
         hadDispatchLux = mHasLatestRawLux;
@@ -671,6 +677,7 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
     triggerRefreshWorker();
 
     mConsecutiveErrors = 0;
+    mPendingStuckCount = 0;
     mInitFailures = 0;
     mRetryAfter = {};
 
@@ -719,7 +726,7 @@ void CwbClient::captureWorkerThread() {
             std::unique_lock<std::mutex> lock(mControlMutex);
             mCv.wait(lock, [this] {
                 return !mRunning || (!mPaused && !mInvalidRoi.load() && hasActiveBacklight() &&
-                                     (mCaptureRequested || mInLockout));
+                                     !mAboveBleedRelevantLux && (mCaptureRequested || mInLockout));
             });
             if (!mRunning) {
                 break;
@@ -731,6 +738,7 @@ void CwbClient::captureWorkerThread() {
         if (currentGen != mLastSeenGen) {
             mInitFailures = 0;
             mConsecutiveErrors = 0;
+            mPendingStuckCount = 0;
             mHasDispatchedCapture = false;
             mRetryAfter = {};
             mLastLockoutProbeTime = {};
@@ -762,11 +770,12 @@ void CwbClient::captureWorkerThread() {
         if (waitDuration > std::chrono::steady_clock::duration::zero()) {
             std::unique_lock<std::mutex> lock(mControlMutex);
             if (mRunning && !mPaused && mCaptureGen == currentGen && mInLockout == inLockout &&
-                (inLockout || mCaptureRequested) && hasActiveBacklight()) {
+                !mAboveBleedRelevantLux && (inLockout || mCaptureRequested) &&
+                hasActiveBacklight()) {
                 mCv.wait_for(lock, waitDuration, [&] {
                     return !mRunning || mPaused || mCaptureGen != currentGen ||
-                           mInLockout != inLockout || (!inLockout && !mCaptureRequested) ||
-                           !hasActiveBacklight();
+                           mInLockout != inLockout || mAboveBleedRelevantLux ||
+                           (!inLockout && !mCaptureRequested) || !hasActiveBacklight();
                 });
             }
             if (!mRunning) {
@@ -785,6 +794,11 @@ void CwbClient::captureWorkerThread() {
 
         ++mConsecutiveErrors;
         bool enterLockout = (mConsecutiveErrors >= kLockoutThreshold);
+        if (mCallbackHandler != nullptr && mCallbackHandler->isPending()) {
+            ++mPendingStuckCount;
+        } else {
+            mPendingStuckCount = 0;
+        }
         bool clearNow = false;
         {
             std::lock_guard<std::mutex> lock(mControlMutex);
@@ -806,6 +820,13 @@ void CwbClient::captureWorkerThread() {
 
         if (clearNow && mCompensator != nullptr) {
             mCompensator->clearSample();
+        }
+
+        if (enterLockout && mPendingStuckCount >= kLockoutThreshold) {
+            // A pending callback never arrived (lost HWC request or composer restart mid-flight):
+            // tear down the stuck session and buffer so lockout probes can reconnect cleanly.
+            releaseCwbWorker(/*freeBuffer=*/true);
+            mPendingStuckCount = 0;
         }
 
         if (enterLockout) {
