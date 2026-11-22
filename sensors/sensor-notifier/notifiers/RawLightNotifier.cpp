@@ -209,7 +209,7 @@ RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
     if (loaded) {
         mCompensator = compensator;
         resolveBacklightScale();
-        mCwbClient = std::make_unique<CwbClient>(geo, mCompensator);
+        mCwbClient = std::make_shared<CwbClient>(geo, mCompensator);
     } else {
         mBacklightScaleResolved = true;
         LOG(INFO) << "No UDALS CWB configuration available; running uncompensated";
