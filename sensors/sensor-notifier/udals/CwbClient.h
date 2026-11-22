@@ -46,7 +46,7 @@ class CwbClient {
     bool isActiveGen(uint64_t gen) const;
     bool ensureCwbInitializedWorker();
     void releaseCwbWorker(bool freeBuffer);
-    void triggerRefreshWorker();
+    bool triggerRefreshWorker();
     CaptureResult requestCwbSample(uint64_t currentGen);
     void computeWeightedRgb(const uint8_t* pixels, float* outR, float* outG, float* outB,
                             float* outTotalWeight) const;
@@ -70,6 +70,7 @@ class CwbClient {
     uint64_t mCaptureGen = 0;
     bool mCaptureRequested = false;
     bool mInLockout = false;
+    bool mAboveBleedRelevantLux = false;
     bool mHasLatestRawLux = false;
     float mLatestRawLux = 0.0f;
     bool mHasRawLuxAnchor = false;
@@ -88,6 +89,7 @@ class CwbClient {
     bool mDisplayBoundsChecked = false;
     uint32_t mInitFailures = 0;
     uint32_t mConsecutiveErrors = 0;
+    uint32_t mPendingStuckCount = 0;
     bool mHasDispatchedCapture = false;
     std::chrono::steady_clock::time_point mLastInitAttempt{};
     std::chrono::steady_clock::time_point mLastDispatchTime{};
