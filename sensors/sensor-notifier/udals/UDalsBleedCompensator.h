@@ -57,6 +57,7 @@ class UDalsBleedCompensator {
     bool mDcMode;
     bool mHbmMode;
     bool mHasSample;
+    bool mWakeGateActive;
     float mNormR;
     float mNormG;
     float mNormB;

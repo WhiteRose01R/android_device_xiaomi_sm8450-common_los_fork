@@ -26,6 +26,7 @@ UDalsBleedCompensator::UDalsBleedCompensator()
       mDcMode(false),
       mHbmMode(false),
       mHasSample(false),
+      mWakeGateActive(false),
       mNormR(0.0f),
       mNormG(0.0f),
       mNormB(0.0f),
@@ -203,6 +204,7 @@ void UDalsBleedCompensator::reset() {
     mBacklight = 0;
     mHbmMode = false;
     mHasSample = false;
+    mWakeGateActive = true;
     mNormR = 0.0f;
     mNormG = 0.0f;
     mNormB = 0.0f;
@@ -212,11 +214,7 @@ void UDalsBleedCompensator::reset() {
 
 void UDalsBleedCompensator::setBacklight(uint32_t brightness) {
     std::lock_guard<std::mutex> lock(mLock);
-    uint32_t clamped = std::min(brightness, mNormalMaxBacklight);
-    if (mBacklight == 0 && clamped > 0 && !mHasSample) {
-        mResetTime = std::chrono::steady_clock::now();
-    }
-    mBacklight = clamped;
+    mBacklight = std::min(brightness, mNormalMaxBacklight);
 }
 
 bool UDalsBleedCompensator::hasSample() const {
@@ -255,6 +253,7 @@ void UDalsBleedCompensator::setSampledRgb(float r, float g, float b) {
         mMedianIndex = 0;
     }
     mHasSample = true;
+    mWakeGateActive = false;
     mLastSampleTime = std::chrono::steady_clock::now();
 }
 
@@ -345,13 +344,14 @@ bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
     std::lock_guard<std::mutex> lock(mLock);
 
     // Suppress flare spikes during display wake prior to first CWB frame capture or timeout
-    if (!mHasSample && mBacklight > 0) {
+    if (mWakeGateActive) {
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::steady_clock::now() - mResetTime)
                                .count();
         if (elapsed < 250) {
             return false;
         }
+        mWakeGateActive = false;
     }
 
     float bleed = calculateBleedLuxLocked();

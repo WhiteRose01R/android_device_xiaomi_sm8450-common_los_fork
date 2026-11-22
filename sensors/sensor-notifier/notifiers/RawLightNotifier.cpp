@@ -267,9 +267,8 @@ void RawLightNotifier::notify() {
         return;
     }
 
-    std::vector<disp_event_type> notifyEvents = {MI_DISP_EVENT_POWER};
+    std::vector<disp_event_type> notifyEvents = {MI_DISP_EVENT_POWER, MI_DISP_EVENT_51_BRIGHTNESS};
     if (mCompensator != nullptr) {
-        notifyEvents.push_back(MI_DISP_EVENT_51_BRIGHTNESS);
         notifyEvents.push_back(MI_DISP_EVENT_HBM);
         notifyEvents.push_back(MI_DISP_EVENT_DC);
     }
@@ -284,10 +283,61 @@ void RawLightNotifier::notify() {
         }
     }
 
-    syncCompensatorDisplayState(disp_fd_.get());
+    bool displayOn = false;
+    bool powerEventSeen = false;
 
-    if (setSensorEnabled(true) && mActive && mCwbClient != nullptr) {
-        mCwbClient->start();
+    auto enterDisplayOn = [&](const uint32_t* initialRawBkl) {
+        if (displayOn) {
+            return;
+        }
+        displayOn = true;
+        if (mCompensator != nullptr) {
+            mCompensator->reset();
+            if (initialRawBkl != nullptr) {
+                resolveBacklightScale();
+                updateBacklight(*initialRawBkl);
+                syncDisplayFeatures(disp_fd_.get(), mCompensator);
+            } else {
+                syncCompensatorDisplayState(disp_fd_.get());
+            }
+        }
+        if (setSensorEnabled(true) && mActive && mCwbClient != nullptr) {
+            mCwbClient->start();
+        }
+    };
+
+    auto enterDisplayOff = [&]() {
+        if (!displayOn) {
+            return;
+        }
+        displayOn = false;
+        setSensorEnabled(false);
+        if (mCwbClient != nullptr) {
+            mCwbClient->stop();
+        }
+        if (mCompensator != nullptr) {
+            mCompensator->reset();
+        }
+    };
+
+    disp_doze_brightness_req dozeReq{};
+    dozeReq.base.disp_id = MI_DISP_PRIMARY;
+    bool isDoze = (ioctl(disp_fd_.get(), MI_DISP_IOCTL_GET_DOZE_BRIGHTNESS, &dozeReq) == 0 &&
+                   dozeReq.doze_brightness != DOZE_TO_NORMAL);
+    if (isDoze) {
+        powerEventSeen = true;
+    } else {
+        disp_brightness_req blReq{};
+        blReq.base.disp_id = MI_DISP_PRIMARY;
+        uint32_t startupBl = 0;
+        if (ioctl(disp_fd_.get(), MI_DISP_IOCTL_GET_BRIGHTNESS, &blReq) == 0) {
+            startupBl = blReq.brightness;
+        } else {
+            readPanelSysfsUint("brightness", &startupBl);
+        }
+        if (startupBl > 0) {
+            enterDisplayOn(&startupBl);
+        }
     }
 
     struct pollfd dispEventPoll = {
@@ -330,27 +380,13 @@ void RawLightNotifier::notify() {
                 if (payloadLength < sizeof(int32_t)) {
                     continue;
                 }
+                powerEventSeen = true;
                 int32_t powerVal = 0;
                 std::memcpy(&powerVal, response->data, sizeof(powerVal));
-                switch (powerVal) {
-                    case MI_DISP_POWER_ON:
-                        if (mCompensator != nullptr) {
-                            mCompensator->reset();
-                            syncCompensatorDisplayState(disp_fd_.get());
-                        }
-                        if (setSensorEnabled(true) && mActive && mCwbClient != nullptr) {
-                            mCwbClient->start();
-                        }
-                        break;
-                    default:
-                        setSensorEnabled(false);
-                        if (mCwbClient != nullptr) {
-                            mCwbClient->stop();
-                        }
-                        if (mCompensator != nullptr) {
-                            mCompensator->reset();
-                        }
-                        break;
+                if (powerVal == MI_DISP_POWER_ON) {
+                    enterDisplayOn(nullptr);
+                } else {
+                    enterDisplayOff();
                 }
                 break;
             }
@@ -364,6 +400,14 @@ void RawLightNotifier::notify() {
                     bklRaw = bkl16;
                 } else {
                     continue;
+                }
+                if (!displayOn) {
+                    // Recover if POWER_ON fired before event registration at boot;
+                    // the 5.10 driver suppresses MI_DISP_EVENT_51_BRIGHTNESS during AOD.
+                    if (!powerEventSeen && bklRaw > 0) {
+                        enterDisplayOn(&bklRaw);
+                    }
+                    break;
                 }
                 updateBacklight(bklRaw);
                 break;
