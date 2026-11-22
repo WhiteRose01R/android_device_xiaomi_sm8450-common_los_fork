@@ -53,15 +53,19 @@ constexpr auto kDrainTimeout = std::chrono::milliseconds(150);
 constexpr auto kLockoutProbeInterval = std::chrono::seconds(2);
 constexpr uint32_t kLockoutThreshold = 3u;
 
-std::array<float, 256> initGammaLut() {
+constexpr float kGammaHigh = 2.0f;
+constexpr float kGammaLow = 1.6f;
+
+std::array<float, 256> initGammaLut(float gamma) {
     std::array<float, 256> lut{};
     for (size_t i = 0; i < 256; ++i) {
-        lut[i] = std::pow(static_cast<float>(i) / 255.0f, 2.2f);
+        lut[i] = std::pow(static_cast<float>(i) / 255.0f, gamma);
     }
     return lut;
 }
 
-const std::array<float, 256> kGammaLut = initGammaLut();
+const std::array<float, 256> kGammaLutHigh = initGammaLut(kGammaHigh);
+const std::array<float, 256> kGammaLutLow = initGammaLut(kGammaLow);
 
 struct ScopedHardwareBufferLock {
     ScopedHardwareBufferLock(AHardwareBuffer* buffer, uint64_t usage)
@@ -284,7 +288,9 @@ void CwbClient::onRawLuxSample(float rawLux) {
         return;
     }
 
+    uint64_t seqBefore = (mCompensator != nullptr) ? mCompensator->getSampleSeq() : 0;
     bool shouldNotify = false;
+    bool upwardPending = false;
     {
         std::lock_guard<std::mutex> lock(mControlMutex);
         if (!mRunning || mPaused) {
@@ -298,6 +304,7 @@ void CwbClient::onRawLuxSample(float rawLux) {
             mSeedAnchorOnNextSample = false;
             mSustainedDeltaCount = 0;
             mSustainedDeltaSign = 0;
+            mUpwardCapturePending = false;
             mCaptureRequested = false;
             shouldNotify = changed;
         } else {
@@ -308,6 +315,7 @@ void CwbClient::onRawLuxSample(float rawLux) {
             if (mInLockout) {
                 mSustainedDeltaCount = 0;
                 mSustainedDeltaSign = 0;
+                mUpwardCapturePending = false;
                 shouldNotify = resumedFromHighLux;
             } else if (mSeedAnchorOnNextSample) {
                 mLastTriggerRawLux = rawLux;
@@ -315,6 +323,7 @@ void CwbClient::onRawLuxSample(float rawLux) {
                 mSeedAnchorOnNextSample = false;
                 mSustainedDeltaCount = 0;
                 mSustainedDeltaSign = 0;
+                mUpwardCapturePending = false;
             } else {
                 float delta = rawLux - mLastTriggerRawLux;
                 float absDelta = std::fabs(delta);
@@ -324,9 +333,15 @@ void CwbClient::onRawLuxSample(float rawLux) {
                         std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
                                    kSustainedMinTriggerDeltaLux, kMaxTriggerDeltaLux);
                 bool shouldTrigger = false;
-                if (!mHasRawLuxAnchor || absDelta >= immediateThreshold) {
+                if (!mHasRawLuxAnchor) {
                     mSustainedDeltaCount = 0;
                     mSustainedDeltaSign = 0;
+                    mUpwardCapturePending = false;
+                    shouldTrigger = true;
+                } else if (absDelta >= immediateThreshold) {
+                    mSustainedDeltaCount = 0;
+                    mSustainedDeltaSign = 0;
+                    mUpwardCapturePending = (delta > 0.0f);
                     shouldTrigger = true;
                 } else if (absDelta >= sustainedThreshold) {
                     int8_t sign = (delta > 0.0f) ? 1 : -1;
@@ -336,9 +351,13 @@ void CwbClient::onRawLuxSample(float rawLux) {
                         mSustainedDeltaSign = sign;
                         mSustainedDeltaCount = 1;
                     }
+                    if (sign < 0) {
+                        mUpwardCapturePending = false;
+                    }
                     if (mSustainedDeltaCount >= kSustainedLowLuxSamples) {
                         mSustainedDeltaCount = 0;
                         mSustainedDeltaSign = 0;
+                        mUpwardCapturePending = (sign > 0);
                         shouldTrigger = true;
                     }
                 } else {
@@ -350,8 +369,15 @@ void CwbClient::onRawLuxSample(float rawLux) {
                     mCaptureRequested = true;
                     shouldNotify = true;
                 }
+
+                upwardPending = hasActiveBacklight() &&
+                                (mUpwardCapturePending ||
+                                 (mSustainedDeltaCount > 0 && mSustainedDeltaSign > 0));
             }
         }
+    }
+    if (mCompensator != nullptr) {
+        mCompensator->updateTransitionHold(upwardPending, rawLux, seqBefore);
     }
     if (shouldNotify) {
         mCv.notify_one();
@@ -519,6 +545,7 @@ bool CwbClient::start() {
         mSeedAnchorOnNextSample = false;
         mSustainedDeltaCount = 0;
         mSustainedDeltaSign = 0;
+        mUpwardCapturePending = false;
         mCaptureRequested = true;
         cb = mActiveCallback;
         if (!mRunning) {
@@ -552,6 +579,7 @@ void CwbClient::stop() {
         mSeedAnchorOnNextSample = false;
         mSustainedDeltaCount = 0;
         mSustainedDeltaSign = 0;
+        mUpwardCapturePending = false;
         gen = ++mCaptureGen;
         cb = mActiveCallback;
     }
@@ -559,14 +587,21 @@ void CwbClient::stop() {
     if (cb != nullptr) {
         cb->abort(gen);
     }
+    if (mCompensator != nullptr) {
+        mCompensator->clearTransitionHold();
+    }
     mCv.notify_all();
 }
 
-void CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outR, float* outG, float* outB,
+void CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outRHigh, float* outGHigh,
+                                   float* outBHigh, float* outRLow, float* outGLow, float* outBLow,
                                    float* outTotalWeight) const {
-    float weightedR = 0.0f;
-    float weightedG = 0.0f;
-    float weightedB = 0.0f;
+    float weightedRHigh = 0.0f;
+    float weightedGHigh = 0.0f;
+    float weightedBHigh = 0.0f;
+    float weightedRLow = 0.0f;
+    float weightedGLow = 0.0f;
+    float weightedBLow = 0.0f;
     float totalWeight = 0.0f;
 
     for (int32_t y = 0; y < mRoiHeight; ++y) {
@@ -596,16 +631,22 @@ void CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outR, float* ou
             uint8_t g = row[offset + 1];
             uint8_t b = row[offset + 2];
 
-            weightedR += kGammaLut[r] * w;
-            weightedG += kGammaLut[g] * w;
-            weightedB += kGammaLut[b] * w;
+            weightedRHigh += kGammaLutHigh[r] * w;
+            weightedGHigh += kGammaLutHigh[g] * w;
+            weightedBHigh += kGammaLutHigh[b] * w;
+            weightedRLow += kGammaLutLow[r] * w;
+            weightedGLow += kGammaLutLow[g] * w;
+            weightedBLow += kGammaLutLow[b] * w;
             totalWeight += w;
         }
     }
 
-    *outR = weightedR;
-    *outG = weightedG;
-    *outB = weightedB;
+    *outRHigh = weightedRHigh;
+    *outGHigh = weightedGHigh;
+    *outBHigh = weightedBHigh;
+    *outRLow = weightedRLow;
+    *outGLow = weightedGLow;
+    *outBLow = weightedBLow;
     *outTotalWeight = totalWeight;
 }
 
@@ -728,21 +769,28 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
         return CaptureResult::kFailed;
     }
 
-    float weightedR = 0.0f;
-    float weightedG = 0.0f;
-    float weightedB = 0.0f;
+    float weightedRHigh = 0.0f;
+    float weightedGHigh = 0.0f;
+    float weightedBHigh = 0.0f;
+    float weightedRLow = 0.0f;
+    float weightedGLow = 0.0f;
+    float weightedBLow = 0.0f;
     float totalWeight = 0.0f;
-    computeWeightedRgb(static_cast<const uint8_t*>(scopedLock.address()), &weightedR, &weightedG,
-                       &weightedB, &totalWeight);
+    computeWeightedRgb(static_cast<const uint8_t*>(scopedLock.address()), &weightedRHigh,
+                       &weightedGHigh, &weightedBHigh, &weightedRLow, &weightedGLow, &weightedBLow,
+                       &totalWeight);
 
     if (totalWeight <= 0.0f) {
         return CaptureResult::kFailed;
     }
 
-    float normR = std::clamp(weightedR / totalWeight, 0.0f, 1.0f);
-    float normG = std::clamp(weightedG / totalWeight, 0.0f, 1.0f);
-    float normB = std::clamp(weightedB / totalWeight, 0.0f, 1.0f);
-    mCompensator->setSampledRgb(normR, normG, normB);
+    float normRHigh = std::clamp(weightedRHigh / totalWeight, 0.0f, 1.0f);
+    float normGHigh = std::clamp(weightedGHigh / totalWeight, 0.0f, 1.0f);
+    float normBHigh = std::clamp(weightedBHigh / totalWeight, 0.0f, 1.0f);
+    float normRLow = std::clamp(weightedRLow / totalWeight, 0.0f, 1.0f);
+    float normGLow = std::clamp(weightedGLow / totalWeight, 0.0f, 1.0f);
+    float normBLow = std::clamp(weightedBLow / totalWeight, 0.0f, 1.0f);
+    mCompensator->setSampledRgb(normRHigh, normGHigh, normBHigh, normRLow, normGLow, normBLow);
 
     mConsecutiveErrors = 0;
     mPendingStuckCount = 0;
@@ -769,14 +817,17 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
                                    kSustainedMinTriggerDeltaLux, kMaxTriggerDeltaLux);
                 if (absDelta >= immediateThreshold) {
                     mCaptureRequested = true;
+                    mUpwardCapturePending = (delta > 0.0f);
                     mSustainedDeltaCount = 0;
                     mSustainedDeltaSign = 0;
                 } else if (absDelta >= sustainedThreshold) {
                     mCaptureRequested = false;
+                    mUpwardCapturePending = false;
                     mSustainedDeltaSign = (delta > 0.0f) ? 1 : -1;
                     mSustainedDeltaCount = 1;
                 } else {
                     mCaptureRequested = false;
+                    mUpwardCapturePending = false;
                     mSustainedDeltaCount = 0;
                     mSustainedDeltaSign = 0;
                 }
@@ -786,6 +837,7 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
                 mSeedAnchorOnNextSample = false;
                 mSustainedDeltaCount = 0;
                 mSustainedDeltaSign = 0;
+                mUpwardCapturePending = false;
                 mCaptureRequested = false;
             }
         } else if (mHasLatestRawLux) {
@@ -794,12 +846,14 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
             mSeedAnchorOnNextSample = false;
             mSustainedDeltaCount = 0;
             mSustainedDeltaSign = 0;
+            mUpwardCapturePending = false;
             mCaptureRequested = false;
         } else {
             mHasRawLuxAnchor = false;
             mSeedAnchorOnNextSample = true;
             mSustainedDeltaCount = 0;
             mSustainedDeltaSign = 0;
+            mUpwardCapturePending = false;
             mCaptureRequested = false;
         }
     }
@@ -902,6 +956,7 @@ void CwbClient::captureWorkerThread() {
                         clearNow = true;
                         mInLockout = true;
                     }
+                    mUpwardCapturePending = false;
                     mCaptureRequested = false;
                 } else if (!mInLockout) {
                     mCaptureRequested = true;
