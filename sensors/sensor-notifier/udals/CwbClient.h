@@ -50,7 +50,8 @@ class CwbClient {
     void releaseCwbWorker(bool freeBuffer);
     void triggerRefreshWorker();
     CaptureResult requestCwbSample(uint64_t currentGen);
-    void computeWeightedRgb(const uint8_t* pixels, float* outR, float* outG, float* outB,
+    void computeWeightedRgb(const uint8_t* pixels, float* outRHigh, float* outGHigh,
+                            float* outBHigh, float* outRLow, float* outGLow, float* outBLow,
                             float* outTotalWeight) const;
 
     UdalsGeometry mGeo;
@@ -80,6 +81,7 @@ class CwbClient {
     bool mSeedAnchorOnNextSample = false;
     uint32_t mSustainedDeltaCount = 0;
     int8_t mSustainedDeltaSign = 0;
+    bool mUpwardCapturePending = false;
     std::shared_ptr<CwbCallbackHandler> mActiveCallback;
     std::thread mWorker;
 
