@@ -183,17 +183,7 @@ void RawLightNotifier::syncCompensatorDisplayState(int dbvFd) {
     if (!synced) {
         uint32_t bkl = 0;
         if (readPanelSysfsUint("brightness", &bkl)) {
-            uint32_t sysfsMax = 0;
-            if (readPanelSysfsUint("max_brightness", &sysfsMax) && sysfsMax > 1) {
-                uint32_t targetMax = mCompensator->getNormalMaxBacklight();
-                uint32_t normalMax = sysfsMax / 2;
-                uint32_t normalized = static_cast<uint32_t>(
-                        (static_cast<uint64_t>(bkl) * targetMax + (normalMax / 2)) / normalMax);
-                mCompensator->setHbmMode(bkl > normalMax);
-                applyNormalizedBacklight(normalized);
-            } else {
-                updateBacklight(bkl);
-            }
+            updateBacklight(bkl);
         }
     }
 }
