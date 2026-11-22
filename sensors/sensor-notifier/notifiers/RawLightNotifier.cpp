@@ -32,6 +32,7 @@ constexpr const char kPanelPowerStateNode[] =
         "/sys/devices/platform/soc/soc:qcom,dsi-display-primary/panel_power_state";
 constexpr const char kDbvNode[] = "/sys/devices/platform/soc/soc:qcom,dsi-display-primary/dbv";
 constexpr int kPanelPowerOn = 0;
+constexpr int kPanelPowerOff = 5;
 
 // Xiaomi SSC vendor sensor type for raw ambient light
 constexpr uint32_t kSensorTypeAmbientlightRaw = 33171111;
@@ -247,12 +248,9 @@ void RawLightNotifier::notify() {
         return;
     }
 
-    android::base::unique_fd dbvFd;
-    if (mCompensator != nullptr) {
-        dbvFd.reset(open(kDbvNode, O_RDONLY));
-        if (dbvFd.get() == -1) {
-            PLOG(WARNING) << "failed to open " << kDbvNode;
-        }
+    android::base::unique_fd dbvFd(open(kDbvNode, O_RDONLY));
+    if (dbvFd.get() == -1) {
+        PLOG(WARNING) << "failed to open " << kDbvNode;
     }
 
     std::vector<struct pollfd> pollfds;
@@ -261,36 +259,81 @@ void RawLightNotifier::notify() {
         pollfds.push_back({.fd = dbvFd.get(), .events = POLLERR | POLLPRI, .revents = POLLPRI});
     }
 
+    bool displayOn = false;
+    bool powerEventSeen = false;
+    bool isInitialRead = true;
+    int lastPowerVal = -1;
+
+    auto enterDisplayOn = [&](const uint32_t* initialRawDbv) {
+        if (displayOn) {
+            return;
+        }
+        displayOn = true;
+        if (mCompensator != nullptr) {
+            mCompensator->reset();
+            if (initialRawDbv != nullptr) {
+                resolveBacklightScale();
+                updateBacklight(*initialRawDbv);
+            } else {
+                syncCompensatorDisplayState(dbvFd.get());
+            }
+        }
+        if (setSensorEnabled(true) && mActive && mCwbClient != nullptr) {
+            mCwbClient->start();
+        }
+    };
+
+    auto enterDisplayOff = [&]() {
+        if (!displayOn) {
+            return;
+        }
+        displayOn = false;
+        setSensorEnabled(false);
+        if (mCwbClient != nullptr) {
+            mCwbClient->stop();
+        }
+        if (mCompensator != nullptr) {
+            mCompensator->reset();
+        }
+    };
+
     while (mActive) {
         if (pollfds[0].revents & (POLLERR | POLLPRI)) {
             int powerVal = 0;
             if (readInt(pollfds[0].fd, &powerVal)) {
+                if (!isInitialRead) {
+                    powerEventSeen = true;
+                }
+                lastPowerVal = powerVal;
                 if (powerVal == kPanelPowerOn) {
-                    if (mCompensator != nullptr) {
-                        mCompensator->reset();
-                        syncCompensatorDisplayState(dbvFd.get());
-                    }
-                    if (setSensorEnabled(true) && mActive && mCwbClient != nullptr) {
-                        mCwbClient->start();
-                    }
+                    enterDisplayOn(nullptr);
                 } else {
-                    setSensorEnabled(false);
-                    if (mCwbClient != nullptr) {
-                        mCwbClient->stop();
-                    }
-                    if (mCompensator != nullptr) {
-                        mCompensator->reset();
-                    }
+                    enterDisplayOff();
                 }
             }
         }
 
         if (pollfds.size() > 1 && (pollfds[1].revents & (POLLERR | POLLPRI))) {
             int dbvVal = 0;
-            if (readInt(pollfds[1].fd, &dbvVal) && dbvVal >= 0 && mEnabled) {
-                updateBacklight(static_cast<uint32_t>(dbvVal));
+            if (readInt(pollfds[1].fd, &dbvVal) && dbvVal >= 0) {
+                if (!displayOn) {
+                    // Fallback for unpatched 6.6 kernels that leave panel_power_state at
+                    // OFF (5) after continuous splash until first lock/unlock; AOD uses LP1/LP2.
+                    if (!powerEventSeen && lastPowerVal == kPanelPowerOff && dbvVal > 0) {
+                        uint32_t sysfsBl = 0;
+                        bool sysfsOk = readPanelSysfsUint("brightness", &sysfsBl);
+                        if (!sysfsOk || sysfsBl > 0) {
+                            uint32_t rawDbv = static_cast<uint32_t>(dbvVal);
+                            enterDisplayOn(&rawDbv);
+                        }
+                    }
+                } else {
+                    updateBacklight(static_cast<uint32_t>(dbvVal));
+                }
             }
         }
+
+        isInitialRead = false;
 
         for (auto& pfd : pollfds) {
             pfd.revents = 0;

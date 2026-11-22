@@ -55,6 +55,7 @@ class UDalsBleedCompensator {
     uint32_t mNormalMaxBacklight;
     bool mHbmMode;
     bool mHasSample;
+    bool mWakeGateActive;
     float mNormR;
     float mNormG;
     float mNormB;
