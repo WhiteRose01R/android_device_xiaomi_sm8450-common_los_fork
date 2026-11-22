@@ -33,5 +33,5 @@ class RawLightNotifier : public SensorNotifier {
     bool mBacklightScaleResolved;
     uint32_t mDeviceNormalMaxBacklight;
     std::shared_ptr<UDalsBleedCompensator> mCompensator;
-    std::unique_ptr<CwbClient> mCwbClient;
+    std::shared_ptr<CwbClient> mCwbClient;
 };

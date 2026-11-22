@@ -42,9 +42,13 @@ struct ScopedHardwareBufferLock {
         : mBuffer(buffer), mLocked(false), mAddr(nullptr) {
         if (mBuffer != nullptr) {
             int err = AHardwareBuffer_lock(mBuffer, usage, -1, nullptr, &mAddr);
-            mLocked = (err == 0);
-            if (mLocked) {
-                CHECK(mAddr != nullptr) << "AHardwareBuffer_lock succeeded with null address";
+            if (err == 0) {
+                if (mAddr != nullptr) {
+                    mLocked = true;
+                } else {
+                    LOG(ERROR) << "AHardwareBuffer_lock succeeded with null address";
+                    AHardwareBuffer_unlock(mBuffer, nullptr);
+                }
             }
         }
     }
@@ -82,12 +86,19 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
         mCv.notify_all();
     }
 
-    void prepareForCapture() {
+    bool prepareForCapture(uint64_t gen) {
         std::lock_guard<std::mutex> lock(mMutex);
+        if (mAbortedGen > gen) {
+            mAborted = true;
+            return false;
+        }
+        mPostedGen = gen;
+        mActiveGen = std::max(mActiveGen, gen);
         mDone = false;
         mAborted = false;
         mError = 0;
         mPending = true;
+        return true;
     }
 
     void cancelPending() {
@@ -100,17 +111,23 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
         return mPending;
     }
 
-    bool consumeIfDone(int32_t* outError) {
+    uint64_t postedGen() const {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mPostedGen;
+    }
+
+    bool consumeIfDone(int32_t* outError, uint64_t* outPostedGen) {
         std::lock_guard<std::mutex> lock(mMutex);
         if (!mDone) {
             return false;
         }
         *outError = mError;
+        *outPostedGen = mPostedGen;
         mDone = false;
         return true;
     }
 
-    bool waitForDone(std::chrono::milliseconds timeout, int32_t* outError) {
+    bool waitForDone(std::chrono::milliseconds timeout, int32_t* outError, uint64_t* outPostedGen) {
         std::unique_lock<std::mutex> lock(mMutex);
         if (!mCv.wait_for(lock, timeout, [this] { return mDone || mAborted; })) {
             return false;
@@ -119,34 +136,40 @@ class CwbCallbackHandler : public DisplayConfig::ConfigCallback {
             return false;
         }
         *outError = mError;
+        *outPostedGen = mPostedGen;
         mDone = false;
         return true;
     }
 
-    void abort() {
+    void abort(uint64_t gen) {
         std::lock_guard<std::mutex> lock(mMutex);
-        mAborted = true;
-        mCv.notify_all();
+        mAbortedGen = std::max(mAbortedGen, gen);
+        if (mAbortedGen > mActiveGen) {
+            mAborted = true;
+            mCv.notify_all();
+        }
+    }
+
+    void clearAbortedIfBefore(uint64_t activeGen) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mActiveGen = std::max(mActiveGen, activeGen);
+        if (mAbortedGen <= mActiveGen) {
+            mAborted = false;
+        }
     }
 
     bool waitForDrain(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mMutex);
-        return mCv.wait_for(lock, timeout, [this] { return !mPending; });
-    }
-
-    void forceReset(bool clearAborted = true) {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mDone = false;
-        mPending = false;
-        mError = 0;
-        if (clearAborted) {
-            mAborted = false;
-        }
+        mCv.wait_for(lock, timeout, [this] { return !mPending || mAborted; });
+        return !mPending;
     }
 
   private:
     mutable std::mutex mMutex;
     std::condition_variable mCv;
+    uint64_t mPostedGen = 0;
+    uint64_t mActiveGen = 0;
+    uint64_t mAbortedGen = 0;
     bool mDone = false;
     bool mPending = false;
     bool mAborted = false;
@@ -159,24 +182,25 @@ CwbClient::CwbClient(UdalsGeometry geo, std::shared_ptr<UDalsBleedCompensator> c
       mRoiHeight(geo.bottom - geo.top),
       mCenterRelX(geo.cx - geo.left),
       mCenterRelY(geo.cy - geo.top),
-      mCompensator(std::move(compensator)),
-      mRunning(false),
-      mPaused(true) {
+      mCompensator(std::move(compensator)) {
     mRadius1Sq = geo.r1 * geo.r1;
     mRadius2Sq = geo.r2 * geo.r2;
     mRadius3Sq = geo.r3 * geo.r3;
 }
 
 CwbClient::~CwbClient() {
+    std::shared_ptr<CwbCallbackHandler> cb;
+    uint64_t gen = 0;
     {
-        std::lock_guard<std::mutex> lock(mLock);
+        std::lock_guard<std::mutex> lock(mControlMutex);
         mRunning = false;
         mPaused = true;
+        gen = ++mCaptureGen;
+        cb = mActiveCallback;
     }
 
-    std::shared_ptr<CwbCallbackHandler> cb = getCallbackHandler();
     if (cb != nullptr) {
-        cb->abort();
+        cb->abort(gen);
     }
 
     mCv.notify_all();
@@ -185,8 +209,7 @@ CwbClient::~CwbClient() {
         mWorker.join();
     }
 
-    std::lock_guard<std::mutex> capLock(mCaptureLock);
-    releaseCwbLocked(true);
+    releaseCwbWorker(/*freeBuffer=*/true);
     mRetiredCallbacks.clear();
 }
 
@@ -194,19 +217,17 @@ bool CwbClient::hasActiveBacklight() const {
     return mCompensator == nullptr || mCompensator->getBacklight() > 0;
 }
 
+bool CwbClient::isActiveGen(uint64_t gen) const {
+    std::lock_guard<std::mutex> lock(mControlMutex);
+    return mRunning && !mPaused && mCaptureGen == gen;
+}
+
 void CwbClient::notifyBacklightChanged() {
-    // Acquire mLock to serialize with mCv.wait() in captureWorkerThread(),
-    // since the backlight state itself is guarded by mCompensator's mutex.
-    std::lock_guard<std::mutex> lock(mLock);
+    std::lock_guard<std::mutex> lock(mControlMutex);
     mCv.notify_all();
 }
 
-std::shared_ptr<CwbCallbackHandler> CwbClient::getCallbackHandler() const {
-    std::lock_guard<std::mutex> cbLock(mCallbackLock);
-    return mCallbackHandler;
-}
-
-void CwbClient::retireCallbackHandlerLocked(std::shared_ptr<CwbCallbackHandler> handler) {
+void CwbClient::retireCallbackHandlerWorker(std::shared_ptr<CwbCallbackHandler> handler) {
     if (handler == nullptr) {
         return;
     }
@@ -221,7 +242,13 @@ void CwbClient::retireCallbackHandlerLocked(std::shared_ptr<CwbCallbackHandler> 
     }
 }
 
-bool CwbClient::ensureCwbInitializedLocked() {
+void CwbClient::triggerRefreshWorker() {
+    if (mCwbClient != nullptr) {
+        mCwbClient->RefreshScreen();
+    }
+}
+
+bool CwbClient::ensureCwbInitializedWorker() {
     if (mInvalidRoi.load() || mGeo.left < 0 || mGeo.top < 0 || mRoiWidth <= 0 || mRoiHeight <= 0) {
         return false;
     }
@@ -231,10 +258,9 @@ bool CwbClient::ensureCwbInitializedLocked() {
     }
 
     auto now = std::chrono::steady_clock::now();
-    uint32_t failures = mInitFailures.load();
-    auto minInterval = (failures >= 15) ? std::chrono::seconds(5) : std::chrono::seconds(1);
-    if (failures > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(
-                                now - mLastInitAttempt) < minInterval) {
+    auto minInterval = (mInitFailures >= 15) ? std::chrono::seconds(5) : std::chrono::seconds(1);
+    if (mInitFailures > 0 && std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     now - mLastInitAttempt) < minInterval) {
         return false;
     }
     mLastInitAttempt = now;
@@ -248,12 +274,13 @@ bool CwbClient::ensureCwbInitializedLocked() {
             uint32_t attempt = ++mInitFailures;
             LOG(WARNING) << "DisplayConfig ClientInterface Create failed (attempt " << attempt
                          << ")";
-            releaseCwbLocked(false);
+            releaseCwbWorker(false);
             return false;
         }
+        mCallbackHandler = std::move(callbackHandler);
         {
-            std::lock_guard<std::mutex> cbLock(mCallbackLock);
-            mCallbackHandler = std::move(callbackHandler);
+            std::lock_guard<std::mutex> lock(mControlMutex);
+            mActiveCallback = mCallbackHandler;
         }
         mCwbClient = client;
     }
@@ -265,7 +292,7 @@ bool CwbClient::ensureCwbInitializedLocked() {
             uint32_t attempt = ++mInitFailures;
             LOG(WARNING) << "Failed to query active builtin display attributes (attempt " << attempt
                          << ")";
-            releaseCwbLocked(true);
+            releaseCwbWorker(true);
             return false;
         }
         mDisplayBoundsChecked = true;
@@ -275,7 +302,7 @@ bool CwbClient::ensureCwbInitializedLocked() {
                        << "," << mGeo.bottom << ") exceeds active display resolution "
                        << attrs.x_res << "x" << attrs.y_res << "; disabling CWB";
             mInvalidRoi = true;
-            releaseCwbLocked(true);
+            releaseCwbWorker(true);
             return false;
         }
     }
@@ -297,7 +324,7 @@ bool CwbClient::ensureCwbInitializedLocked() {
         if (AHardwareBuffer_allocate(&desc, &mCwbBuffer) != 0 || mCwbBuffer == nullptr) {
             uint32_t attempt = ++mInitFailures;
             LOG(WARNING) << "Failed to allocate CWB buffer (attempt " << attempt << ")";
-            releaseCwbLocked(true);
+            releaseCwbWorker(true);
             return false;
         }
 
@@ -307,7 +334,7 @@ bool CwbClient::ensureCwbInitializedLocked() {
             desc.height < static_cast<uint32_t>(mRoiHeight)) {
             mInitFailures++;
             LOG(ERROR) << "Allocated CWB buffer smaller than ROI";
-            releaseCwbLocked(true);
+            releaseCwbWorker(true);
             return false;
         }
 
@@ -315,7 +342,7 @@ bool CwbClient::ensureCwbInitializedLocked() {
         if (mCwbBufferHandle == nullptr) {
             mInitFailures++;
             LOG(WARNING) << "Failed to get native handle for CWB buffer";
-            releaseCwbLocked(true);
+            releaseCwbWorker(true);
             return false;
         }
 
@@ -326,16 +353,24 @@ bool CwbClient::ensureCwbInitializedLocked() {
     return true;
 }
 
-void CwbClient::releaseCwbLocked(bool freeBuffer) {
-    std::shared_ptr<CwbCallbackHandler> retired;
+void CwbClient::releaseCwbWorker(bool freeBuffer) {
+    uint64_t abortGen = 0;
     {
-        std::lock_guard<std::mutex> cbLock(mCallbackLock);
-        retired = std::move(mCallbackHandler);
+        std::lock_guard<std::mutex> lock(mControlMutex);
+        abortGen = mCaptureGen;
+        mActiveCallback.reset();
     }
+
+    std::shared_ptr<CwbCallbackHandler> retired = std::move(mCallbackHandler);
     if (retired != nullptr) {
-        retired->abort();
+        retired->abort(abortGen);
         retired->cancelPending();
-        retireCallbackHandlerLocked(std::move(retired));
+        retireCallbackHandlerWorker(std::move(retired));
+    }
+
+    if (mCwbClient != nullptr) {
+        DisplayConfig::ClientInterface::Destroy(mCwbClient);
+        mCwbClient = nullptr;
     }
 
     if (freeBuffer) {
@@ -346,79 +381,52 @@ void CwbClient::releaseCwbLocked(bool freeBuffer) {
         }
         mBufferStride = 0;
     }
-
-    if (mCwbClient != nullptr) {
-        DisplayConfig::ClientInterface::Destroy(mCwbClient);
-        mCwbClient = nullptr;
-    }
 }
 
 bool CwbClient::start() {
     if (mInvalidRoi.load()) {
         return false;
     }
-    std::lock_guard<std::mutex> stateLock(mStateMutex);
+    std::shared_ptr<CwbCallbackHandler> cb;
+    uint64_t gen = 0;
     {
-        std::lock_guard<std::mutex> capLock(mCaptureLock);
-        mCaptureGen++;
-        mInitFailures = 0;
-        mPendingTimeouts = 0;
-        mConsecutiveErrors = 0;
-        mRefreshAttempts = 0;
-        std::shared_ptr<CwbCallbackHandler> cb = getCallbackHandler();
-        if (cb != nullptr && !cb->isPending()) {
-            cb->forceReset();
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(mLock);
+        std::lock_guard<std::mutex> lock(mControlMutex);
+        gen = ++mCaptureGen;
         mPaused = false;
+        cb = mActiveCallback;
         if (!mRunning) {
             mRunning = true;
             mWorker = std::thread(&CwbClient::captureWorkerThread, this);
         }
+    }
+    if (cb != nullptr) {
+        cb->clearAbortedIfBefore(gen);
     }
     mCv.notify_all();
     return true;
 }
 
 void CwbClient::stop() {
-    std::lock_guard<std::mutex> stateLock(mStateMutex);
+    std::shared_ptr<CwbCallbackHandler> cb;
+    uint64_t gen = 0;
     {
-        std::lock_guard<std::mutex> lock(mLock);
+        std::lock_guard<std::mutex> lock(mControlMutex);
         if (!mRunning || mPaused) {
             return;
         }
         mPaused = true;
+        gen = ++mCaptureGen;
+        cb = mActiveCallback;
     }
 
-    std::shared_ptr<CwbCallbackHandler> cb = getCallbackHandler();
     if (cb != nullptr) {
-        cb->abort();
+        cb->abort(gen);
     }
-
     mCv.notify_all();
-
-    std::lock_guard<std::mutex> capLock(mCaptureLock);
-    mCaptureGen++;
-    cb = getCallbackHandler();
-    if (cb != nullptr) {
-        if (cb->isPending() && !cb->waitForDrain(std::chrono::milliseconds(80))) {
-            // Drop the session while keeping the buffer if a pre-sleep capture failed to drain.
-            releaseCwbLocked(/*freeBuffer=*/false);
-        } else {
-            // Keep mAborted set until next start() so any concurrent waitForDone() exits
-            // immediately.
-            cb->forceReset(/*clearAborted=*/false);
-        }
-    }
-    mPendingTimeouts = 0;
-    mConsecutiveErrors = 0;
-    mRefreshAttempts = 0;
 }
 
-void CwbClient::computeWeightedRgbLocked(const uint8_t* pixels, float* outR, float* outG,
-                                         float* outB, float* outTotalWeight) const {
+void CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outR, float* outG, float* outB,
+                                   float* outTotalWeight) const {
     float weightedR = 0.0f;
     float weightedG = 0.0f;
     float weightedB = 0.0f;
@@ -469,87 +477,116 @@ bool CwbClient::requestCwbSample(bool* outRefreshTriggered) {
         *outRefreshTriggered = false;
     }
 
-    uint64_t captureGen = 0;
-    int32_t cwbError = 0;
-    bool bufferReady = false;
-    bool wasPending = false;
-    std::shared_ptr<CwbCallbackHandler> cb;
-
+    uint64_t currentGen = 0;
     {
-        std::lock_guard<std::mutex> capLock(mCaptureLock);
+        std::lock_guard<std::mutex> lock(mControlMutex);
         if (!mRunning || mPaused || mCompensator == nullptr) {
             return false;
         }
+        currentGen = mCaptureGen;
+    }
 
-        if (mCompensator->getBacklight() == 0) {
-            return false;
+    if (currentGen != mLastSeenGen) {
+        mInitFailures = 0;
+        mPendingTimeouts = 0;
+        mConsecutiveErrors = 0;
+        mRefreshAttempts = 0;
+        mLastSeenGen = currentGen;
+    }
+
+    if (mCompensator->getBacklight() == 0) {
+        return false;
+    }
+
+    int32_t cwbError = 0;
+    uint64_t postedGen = 0;
+    bool bufferReady = false;
+    bool wasPending = false;
+
+    if (mCallbackHandler != nullptr) {
+        if (mCallbackHandler->consumeIfDone(&cwbError, &postedGen)) {
+            if (postedGen == currentGen) {
+                bufferReady = true;
+            }
         }
 
-        if (!ensureCwbInitializedLocked() || mCwbBufferHandle == nullptr) {
-            return false;
-        }
-
-        cb = getCallbackHandler();
-        if (cb == nullptr) {
-            return false;
-        }
-
-        captureGen = mCaptureGen;
-        bufferReady = cb->consumeIfDone(&cwbError);
-
-        if (!bufferReady) {
-            wasPending = cb->isPending();
-            if (!wasPending) {
-                DisplayConfig::Rect roiRect = {
-                        .left = static_cast<uint32_t>(mGeo.left),
-                        .top = static_cast<uint32_t>(mGeo.top),
-                        .right = static_cast<uint32_t>(mGeo.right),
-                        .bottom = static_cast<uint32_t>(mGeo.bottom),
-                };
-
-                cb->prepareForCapture();
-                int ret = mCwbClient->SetCWBOutputBuffer(kPrimaryDisplayId, roiRect, true,
-                                                         mCwbBufferHandle);
-                if (ret != 0) {
-                    cb->cancelPending();
-                    ++mConsecutiveErrors;
+        if (!bufferReady && mCallbackHandler->isPending()) {
+            if (mCallbackHandler->postedGen() != currentGen) {
+                // Drain in-flight pre-sleep capture across off->on wake before dispatching anew.
+                mCallbackHandler->clearAbortedIfBefore(currentGen);
+                triggerRefreshWorker();
+                bool drained = mCallbackHandler->waitForDrain(std::chrono::milliseconds(150));
+                if (!isActiveGen(currentGen)) {
                     return false;
                 }
+                if (drained) {
+                    int32_t ignoredErr = 0;
+                    uint64_t ignoredGen = 0;
+                    mCallbackHandler->consumeIfDone(&ignoredErr, &ignoredGen);
+                    mPendingTimeouts = 0;
+                    mRefreshAttempts = 0;
+                } else {
+                    releaseCwbWorker(/*freeBuffer=*/true);
+                    mInitFailures++;
+                    mPendingTimeouts = 0;
+                    mRefreshAttempts = 0;
+                    return false;
+                }
+            } else {
+                wasPending = true;
             }
+        }
+    }
+
+    if (!bufferReady && !wasPending) {
+        if (!ensureCwbInitializedWorker() || mCwbBufferHandle == nullptr ||
+            mCallbackHandler == nullptr) {
+            return false;
+        }
+
+        DisplayConfig::Rect roiRect = {
+                .left = static_cast<uint32_t>(mGeo.left),
+                .top = static_cast<uint32_t>(mGeo.top),
+                .right = static_cast<uint32_t>(mGeo.right),
+                .bottom = static_cast<uint32_t>(mGeo.bottom),
+        };
+
+        if (!isActiveGen(currentGen) || !mCallbackHandler->prepareForCapture(currentGen)) {
+            return false;
+        }
+        int ret =
+                mCwbClient->SetCWBOutputBuffer(kPrimaryDisplayId, roiRect, true, mCwbBufferHandle);
+        if (ret != 0) {
+            mCallbackHandler->cancelPending();
+            ++mConsecutiveErrors;
+            return false;
         }
     }
 
     if (!bufferReady) {
         auto waitMs = wasPending ? std::chrono::milliseconds(20) : std::chrono::milliseconds(80);
-        if (cb->waitForDone(waitMs, &cwbError)) {
-            bufferReady = true;
-        } else {
-            std::lock_guard<std::mutex> capLock(mCaptureLock);
-            if (!mRunning || mPaused || captureGen != mCaptureGen || mCompensator == nullptr) {
+        if (mCallbackHandler->waitForDone(waitMs, &cwbError, &postedGen)) {
+            if (postedGen != currentGen) {
                 return false;
             }
-            uint32_t timeouts = ++mPendingTimeouts;
-            if (!mCompensator->hasSample() && mRefreshAttempts < 3 && mCwbClient != nullptr) {
-                mCwbClient->RefreshScreen();
+            bufferReady = true;
+        } else {
+            if (!isActiveGen(currentGen) || mCompensator == nullptr) {
+                return false;
+            }
+            mPendingTimeouts++;
+            if (!mCompensator->hasSample() && mRefreshAttempts < 3) {
+                triggerRefreshWorker();
                 mRefreshAttempts++;
                 if (outRefreshTriggered != nullptr) {
                     *outRefreshTriggered = true;
                 }
-            } else if (timeouts >= (mCompensator->hasSample() ? 10u : 5u)) {
-                // libdisplayconfig.qti does not propagate HIDL transport errors on
-                // SetCWBOutputBuffer; recreate the client session after sustained timeouts.
-                releaseCwbLocked(/*freeBuffer=*/true);
-                mInitFailures++;
-                mPendingTimeouts = 0;
-                mRefreshAttempts = 0;
             }
             return false;
         }
     }
 
-    std::lock_guard<std::mutex> capLock(mCaptureLock);
-    if (!mRunning || mPaused || captureGen != mCaptureGen || mCompensator == nullptr ||
-        mCwbBuffer == nullptr) {
+    if (!isActiveGen(currentGen) || mCompensator == nullptr || mCwbBuffer == nullptr) {
         return false;
     }
 
@@ -573,8 +610,8 @@ bool CwbClient::requestCwbSample(bool* outRefreshTriggered) {
     float weightedG = 0.0f;
     float weightedB = 0.0f;
     float totalWeight = 0.0f;
-    computeWeightedRgbLocked(static_cast<const uint8_t*>(scopedLock.address()), &weightedR,
-                             &weightedG, &weightedB, &totalWeight);
+    computeWeightedRgb(static_cast<const uint8_t*>(scopedLock.address()), &weightedR, &weightedG,
+                       &weightedB, &totalWeight);
 
     if (totalWeight > 0.0f) {
         float normR = std::clamp(weightedR / totalWeight, 0.0f, 1.0f);
@@ -594,9 +631,9 @@ void CwbClient::captureWorkerThread() {
     // 5 FPS (200 ms) limits CWB frequency boost while matching ALS integration periods
     const auto kSampleInterval = std::chrono::milliseconds(200);
 
-    while (mRunning) {
+    while (true) {
         {
-            std::unique_lock<std::mutex> lock(mLock);
+            std::unique_lock<std::mutex> lock(mControlMutex);
             mCv.wait(lock, [this] {
                 return !mRunning || (!mPaused && !mInvalidRoi.load() && hasActiveBacklight());
             });
@@ -612,26 +649,37 @@ void CwbClient::captureWorkerThread() {
             continue;
         }
 
-        if (mRunning && !mPaused && !hasActiveBacklight()) {
+        bool shouldSkipSleep = false;
+        {
+            std::lock_guard<std::mutex> lock(mControlMutex);
+            if (!mRunning) {
+                break;
+            }
+            if (!mPaused && !hasActiveBacklight()) {
+                shouldSkipSleep = true;
+            }
+        }
+        if (shouldSkipSleep) {
             continue;
         }
 
         auto sleepDuration = kSampleInterval;
-        uint32_t initFailures = mInitFailures.load();
-        uint32_t pendingTimeouts = mPendingTimeouts.load();
-        uint32_t consecutiveErrors = mConsecutiveErrors.load();
-        if (initFailures >= 15 || consecutiveErrors >= 15) {
+        if (mInitFailures >= 15 || mConsecutiveErrors >= 15) {
             sleepDuration = std::chrono::seconds(5);
         } else if (refreshTriggered) {
             // Re-check within ~2 vsyncs so initial wake compensation beats the wake flare gate.
             sleepDuration = std::chrono::milliseconds(30);
-        } else if (!sampled && (pendingTimeouts > 0 || consecutiveErrors > 0 || initFailures > 0)) {
-            sleepDuration = (pendingTimeouts >= 5 || consecutiveErrors >= 5 || initFailures >= 5)
+        } else if (!sampled &&
+                   (mPendingTimeouts > 0 || mConsecutiveErrors > 0 || mInitFailures > 0)) {
+            sleepDuration = (mPendingTimeouts >= 5 || mConsecutiveErrors >= 5 || mInitFailures >= 5)
                                     ? std::chrono::milliseconds(500)
                                     : std::chrono::milliseconds(300);
         }
 
-        std::unique_lock<std::mutex> lock(mLock);
+        std::unique_lock<std::mutex> lock(mControlMutex);
         mCv.wait_for(lock, sleepDuration, [this] { return !mRunning || mPaused; });
+        if (!mRunning) {
+            break;
+        }
     }
 }

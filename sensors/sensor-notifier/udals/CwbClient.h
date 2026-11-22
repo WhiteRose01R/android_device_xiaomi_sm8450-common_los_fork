@@ -37,13 +37,14 @@ class CwbClient {
   private:
     void captureWorkerThread();
     bool hasActiveBacklight() const;
-    std::shared_ptr<CwbCallbackHandler> getCallbackHandler() const;
-    void retireCallbackHandlerLocked(std::shared_ptr<CwbCallbackHandler> handler);
-    bool ensureCwbInitializedLocked();
-    void releaseCwbLocked(bool freeBuffer);
+    bool isActiveGen(uint64_t gen) const;
+    void retireCallbackHandlerWorker(std::shared_ptr<CwbCallbackHandler> handler);
+    bool ensureCwbInitializedWorker();
+    void releaseCwbWorker(bool freeBuffer);
+    void triggerRefreshWorker();
     bool requestCwbSample(bool* outRefreshTriggered);
-    void computeWeightedRgbLocked(const uint8_t* pixels, float* outR, float* outG, float* outB,
-                                  float* outTotalWeight) const;
+    void computeWeightedRgb(const uint8_t* pixels, float* outR, float* outG, float* outB,
+                            float* outTotalWeight) const;
 
     UdalsGeometry mGeo;
     int32_t mRoiWidth;
@@ -55,17 +56,18 @@ class CwbClient {
     int32_t mRadius3Sq;
 
     std::shared_ptr<UDalsBleedCompensator> mCompensator;
-    std::atomic<bool> mRunning;
-    std::atomic<bool> mPaused;
+    std::atomic<bool> mInvalidRoi{false};
+
+    mutable std::mutex mControlMutex;
+    std::condition_variable mCv;
+    bool mRunning = false;
+    bool mPaused = true;
+    uint64_t mCaptureGen = 0;
+    std::shared_ptr<CwbCallbackHandler> mActiveCallback;
     std::thread mWorker;
 
-    std::mutex mStateMutex;
-    std::mutex mLock;
-    std::mutex mCaptureLock;
-    mutable std::mutex mCallbackLock;
-    std::condition_variable mCv;
-    uint64_t mCaptureGen = 0;
-
+    // Worker-thread-exclusive CWB session and buffer state.
+    uint64_t mLastSeenGen = 0;
     DisplayConfig::ClientInterface* mCwbClient = nullptr;
     std::shared_ptr<CwbCallbackHandler> mCallbackHandler;
     std::deque<std::shared_ptr<CwbCallbackHandler>> mRetiredCallbacks;
@@ -73,10 +75,9 @@ class CwbClient {
     const struct native_handle* mCwbBufferHandle = nullptr;
     uint32_t mBufferStride = 0;
     bool mDisplayBoundsChecked = false;
-    std::atomic<bool> mInvalidRoi{false};
-    std::atomic<uint32_t> mInitFailures{0};
-    std::atomic<uint32_t> mPendingTimeouts{0};
-    std::atomic<uint32_t> mConsecutiveErrors{0};
-    std::atomic<uint32_t> mRefreshAttempts{0};
+    uint32_t mInitFailures = 0;
+    uint32_t mPendingTimeouts = 0;
+    uint32_t mConsecutiveErrors = 0;
+    uint32_t mRefreshAttempts = 0;
     std::chrono::steady_clock::time_point mLastInitAttempt{};
 };
