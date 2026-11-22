@@ -103,13 +103,6 @@ static void syncDisplayFeatures(int dispFd,
     if (ioctl(dispFd, MI_DISP_IOCTL_GET_FEATURE, &req) == 0) {
         compensator->setDcMode(req.feature_val != FEATURE_OFF);
     }
-
-    req = {};
-    req.base.disp_id = MI_DISP_PRIMARY;
-    req.feature_id = DISP_FEATURE_HBM;
-    if (ioctl(dispFd, MI_DISP_IOCTL_GET_FEATURE, &req) == 0) {
-        compensator->setHbmMode(req.feature_val != FEATURE_OFF);
-    }
 }
 
 }  // namespace
@@ -269,7 +262,6 @@ void RawLightNotifier::notify() {
 
     std::vector<disp_event_type> notifyEvents = {MI_DISP_EVENT_POWER, MI_DISP_EVENT_51_BRIGHTNESS};
     if (mCompensator != nullptr) {
-        notifyEvents.push_back(MI_DISP_EVENT_HBM);
         notifyEvents.push_back(MI_DISP_EVENT_DC);
     }
 
@@ -410,17 +402,6 @@ void RawLightNotifier::notify() {
                     break;
                 }
                 updateBacklight(bklRaw);
-                break;
-            }
-            case MI_DISP_EVENT_HBM: {
-                if (payloadLength < sizeof(int32_t)) {
-                    continue;
-                }
-                int32_t hbmVal = 0;
-                std::memcpy(&hbmVal, response->data, sizeof(hbmVal));
-                if (mCompensator != nullptr) {
-                    mCompensator->setHbmMode(hbmVal != 0);
-                }
                 break;
             }
             case MI_DISP_EVENT_DC: {
