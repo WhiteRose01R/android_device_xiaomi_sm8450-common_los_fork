@@ -39,12 +39,19 @@ constexpr uint32_t kSensorTypeAmbientlightRaw = 33171111;
 
 class RawLightSensorCallback : public IEventQueueCallback {
   public:
-    RawLightSensorCallback(std::shared_ptr<UDalsBleedCompensator> compensator, float msgUnknown1)
-        : mCompensator(std::move(compensator)), mMsgUnknown1(msgUnknown1) {}
+    RawLightSensorCallback(std::shared_ptr<UDalsBleedCompensator> compensator,
+                           std::weak_ptr<CwbClient> cwbClient, float msgUnknown1)
+        : mCompensator(std::move(compensator)),
+          mCwbClient(std::move(cwbClient)),
+          mMsgUnknown1(msgUnknown1) {}
 
     Return<void> onEvent(const Event& e) override {
         float rawLux = e.u.vec4.y;
         float compensatedLux = rawLux;
+
+        if (auto cwb = mCwbClient.lock()) {
+            cwb->onRawLuxSample(rawLux);
+        }
 
         if (mCompensator != nullptr) {
             if (!mCompensator->compensate(rawLux, &compensatedLux)) {
@@ -70,6 +77,7 @@ class RawLightSensorCallback : public IEventQueueCallback {
 
   private:
     std::shared_ptr<UDalsBleedCompensator> mCompensator;
+    std::weak_ptr<CwbClient> mCwbClient;
     float mMsgUnknown1;
 };
 
@@ -218,7 +226,7 @@ RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
     float msgUnknown1 = static_cast<float>(android::base::GetUintProperty<uint32_t>(
             "ro.vendor.sensors.notifier.raw_light.unknown1", 2u));
     initializeSensorQueue("xiaomi.sensor.ambientlight.factory", false,
-                          new RawLightSensorCallback(mCompensator, msgUnknown1));
+                          new RawLightSensorCallback(mCompensator, mCwbClient, msgUnknown1));
 }
 
 RawLightNotifier::~RawLightNotifier() {

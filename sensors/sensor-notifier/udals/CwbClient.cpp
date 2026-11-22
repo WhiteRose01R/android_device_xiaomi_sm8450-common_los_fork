@@ -40,6 +40,16 @@ using aidl::vendor::qti::hardware::display::config::TUIEventType;
 namespace {
 
 constexpr int32_t kPrimaryDisplayId = static_cast<int32_t>(DisplayType::PRIMARY);
+constexpr float kMaxBleedRelevantLux = 15000.0f;
+constexpr float kMinTriggerDeltaLux = 1.5f;
+constexpr float kMaxTriggerDeltaLux = 250.0f;
+constexpr float kTriggerRelativeDelta = 0.08f;
+constexpr auto kMinDispatchInterval = std::chrono::milliseconds(250);
+constexpr auto kInitialWaitTimeout = std::chrono::milliseconds(100);
+constexpr auto kPokeWaitTimeout = std::chrono::milliseconds(100);
+constexpr auto kDrainTimeout = std::chrono::milliseconds(150);
+constexpr auto kLockoutProbeInterval = std::chrono::seconds(2);
+constexpr uint32_t kLockoutThreshold = 3u;
 
 std::array<float, 256> initGammaLut() {
     std::array<float, 256> lut{};
@@ -261,7 +271,52 @@ bool CwbClient::isActiveGen(uint64_t gen) const {
 
 void CwbClient::notifyBacklightChanged() {
     std::lock_guard<std::mutex> lock(mControlMutex);
-    mCv.notify_all();
+    if (mRunning && !mPaused && (mCaptureRequested || mInLockout) && hasActiveBacklight()) {
+        mCv.notify_all();
+    }
+}
+
+void CwbClient::onRawLuxSample(float rawLux) {
+    if (!std::isfinite(rawLux) || rawLux < 0.0f || mInvalidRoi.load()) {
+        return;
+    }
+
+    bool shouldNotify = false;
+    {
+        std::lock_guard<std::mutex> lock(mControlMutex);
+        if (!mRunning || mPaused) {
+            return;
+        }
+        if (rawLux >= kMaxBleedRelevantLux) {
+            mHasLatestRawLux = false;
+            mHasRawLuxAnchor = false;
+            mSeedAnchorOnNextSample = false;
+            mCaptureRequested = false;
+            return;
+        }
+        mLatestRawLux = rawLux;
+        mHasLatestRawLux = true;
+        if (mInLockout) {
+            return;
+        }
+        if (mSeedAnchorOnNextSample) {
+            mLastTriggerRawLux = rawLux;
+            mHasRawLuxAnchor = true;
+            mSeedAnchorOnNextSample = false;
+            return;
+        }
+        float threshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
+                                     kMinTriggerDeltaLux, kMaxTriggerDeltaLux);
+        if (!mHasRawLuxAnchor || std::fabs(rawLux - mLastTriggerRawLux) >= threshold) {
+            if (!mCaptureRequested) {
+                mCaptureRequested = true;
+                shouldNotify = true;
+            }
+        }
+    }
+    if (shouldNotify) {
+        mCv.notify_one();
+    }
 }
 
 void CwbClient::triggerRefreshWorker() {
@@ -412,6 +467,13 @@ bool CwbClient::start() {
         std::lock_guard<std::mutex> lock(mControlMutex);
         gen = ++mCaptureGen;
         mPaused = false;
+        mInLockout = false;
+        mHasLatestRawLux = false;
+        mLatestRawLux = 0.0f;
+        mHasRawLuxAnchor = false;
+        mLastTriggerRawLux = 0.0f;
+        mSeedAnchorOnNextSample = false;
+        mCaptureRequested = true;
         cb = mActiveCallback;
         if (!mRunning) {
             mRunning = true;
@@ -434,6 +496,13 @@ void CwbClient::stop() {
             return;
         }
         mPaused = true;
+        mCaptureRequested = false;
+        mInLockout = false;
+        mHasLatestRawLux = false;
+        mLatestRawLux = 0.0f;
+        mHasRawLuxAnchor = false;
+        mLastTriggerRawLux = 0.0f;
+        mSeedAnchorOnNextSample = false;
         gen = ++mCaptureGen;
         cb = mActiveCallback;
     }
@@ -491,30 +560,18 @@ void CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outR, float* ou
     *outTotalWeight = totalWeight;
 }
 
-bool CwbClient::requestCwbSample(bool* outRefreshTriggered) {
-    if (outRefreshTriggered != nullptr) {
-        *outRefreshTriggered = false;
-    }
-
-    uint64_t currentGen = 0;
+CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
+    bool hadDispatchLux = false;
+    float dispatchRawLux = 0.0f;
     {
         std::lock_guard<std::mutex> lock(mControlMutex);
-        if (!mRunning || mPaused || mCompensator == nullptr) {
-            return false;
+        if (!mRunning || mPaused || mCaptureGen != currentGen || mCompensator == nullptr ||
+            !hasActiveBacklight()) {
+            return CaptureResult::kAborted;
         }
-        currentGen = mCaptureGen;
-    }
-
-    if (currentGen != mLastSeenGen) {
-        mInitFailures = 0;
-        mPendingTimeouts = 0;
-        mConsecutiveErrors = 0;
-        mRefreshAttempts = 0;
-        mLastSeenGen = currentGen;
-    }
-
-    if (mCompensator->getBacklight() == 0) {
-        return false;
+        hadDispatchLux = mHasLatestRawLux;
+        dispatchRawLux = mLatestRawLux;
+        mCaptureRequested = false;
     }
 
     int32_t cwbError = 0;
@@ -534,23 +591,18 @@ bool CwbClient::requestCwbSample(bool* outRefreshTriggered) {
                 // Drain in-flight pre-sleep capture across off->on wake before dispatching anew.
                 mCallbackHandler->clearAbortedIfBefore(currentGen);
                 triggerRefreshWorker();
-                bool drained = mCallbackHandler->waitForDrain(std::chrono::milliseconds(150));
+                bool drained = mCallbackHandler->waitForDrain(kDrainTimeout);
                 if (!isActiveGen(currentGen)) {
-                    return false;
+                    return CaptureResult::kAborted;
                 }
                 if (drained) {
                     int32_t ignoredErr = 0;
                     uint64_t ignoredGen = 0;
                     mCallbackHandler->consumeIfDone(&ignoredErr, &ignoredGen);
-                    mPendingTimeouts = 0;
-                    mRefreshAttempts = 0;
                 } else {
                     // Allocate a fresh buffer (new BUFFER_ID) on the next attempt after drain fail.
                     releaseCwbWorker(/*freeBuffer=*/true);
-                    mInitFailures++;
-                    mPendingTimeouts = 0;
-                    mRefreshAttempts = 0;
-                    return false;
+                    return CaptureResult::kFailed;
                 }
             } else {
                 wasPending = true;
@@ -561,7 +613,7 @@ bool CwbClient::requestCwbSample(bool* outRefreshTriggered) {
     if (!bufferReady && !wasPending) {
         if (!ensureCwbInitializedWorker() || mCwbBufferHandle == nullptr ||
             mCallbackHandler == nullptr) {
-            return false;
+            return isActiveGen(currentGen) ? CaptureResult::kFailed : CaptureResult::kAborted;
         }
 
         Rect roiRect = {
@@ -572,8 +624,11 @@ bool CwbClient::requestCwbSample(bool* outRefreshTriggered) {
         };
 
         if (!isActiveGen(currentGen) || !mCallbackHandler->prepareForCapture(currentGen)) {
-            return false;
+            return CaptureResult::kAborted;
         }
+        mLastDispatchTime = std::chrono::steady_clock::now();
+        mHasDispatchedCapture = true;
+
         ndk::ScopedAStatus status =
                 mCwbClient->setCWBOutputBuffer(mCallbackHandler, kPrimaryDisplayId, roiRect, true,
                                                ::android::dupToAidl(mCwbBufferHandle));
@@ -582,53 +637,42 @@ bool CwbClient::requestCwbSample(bool* outRefreshTriggered) {
             if (status.getStatus() == STATUS_DEAD_OBJECT) {
                 releaseCwbWorker(/*freeBuffer=*/false);
             }
-            ++mConsecutiveErrors;
-            return false;
+            return isActiveGen(currentGen) ? CaptureResult::kFailed : CaptureResult::kAborted;
         }
     }
 
     if (!bufferReady) {
-        auto waitMs = wasPending ? std::chrono::milliseconds(20) : std::chrono::milliseconds(80);
-        if (mCallbackHandler->waitForDone(waitMs, &cwbError, &postedGen)) {
-            if (postedGen != currentGen) {
-                return false;
-            }
-            bufferReady = true;
-        } else {
+        if (!mCallbackHandler->waitForDone(kInitialWaitTimeout, &cwbError, &postedGen)) {
             if (!isActiveGen(currentGen) || mCompensator == nullptr) {
-                return false;
+                return CaptureResult::kAborted;
             }
-            mPendingTimeouts++;
-            if (!mCompensator->hasSample() && mRefreshAttempts < 3) {
-                triggerRefreshWorker();
-                mRefreshAttempts++;
-                if (outRefreshTriggered != nullptr) {
-                    *outRefreshTriggered = true;
-                }
+            if (wasPending) {
+                return CaptureResult::kFailed;
             }
-            return false;
+            // Idle SurfaceFlinger may defer CWB completion until a commit occurs:
+            // poke refreshScreen once and wait immediately without dispatch cooldown.
+            triggerRefreshWorker();
+            if (!mCallbackHandler->waitForDone(kPokeWaitTimeout, &cwbError, &postedGen)) {
+                return isActiveGen(currentGen) ? CaptureResult::kFailed : CaptureResult::kAborted;
+            }
+        }
+        if (postedGen != currentGen) {
+            return CaptureResult::kAborted;
         }
     }
 
     if (!isActiveGen(currentGen) || mCompensator == nullptr || mCwbBuffer == nullptr) {
-        return false;
+        return CaptureResult::kAborted;
     }
 
-    mPendingTimeouts = 0;
-
     if (cwbError != 0) {
-        ++mConsecutiveErrors;
-        return false;
+        return CaptureResult::kFailed;
     }
 
     ScopedHardwareBufferLock scopedLock(mCwbBuffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN);
     if (!scopedLock.isLocked()) {
-        ++mConsecutiveErrors;
-        return false;
+        return CaptureResult::kFailed;
     }
-
-    mConsecutiveErrors = 0;
-    mInitFailures = 0;
 
     float weightedR = 0.0f;
     float weightedG = 0.0f;
@@ -637,73 +681,158 @@ bool CwbClient::requestCwbSample(bool* outRefreshTriggered) {
     computeWeightedRgb(static_cast<const uint8_t*>(scopedLock.address()), &weightedR, &weightedG,
                        &weightedB, &totalWeight);
 
-    if (totalWeight > 0.0f) {
-        float normR = std::clamp(weightedR / totalWeight, 0.0f, 1.0f);
-        float normG = std::clamp(weightedG / totalWeight, 0.0f, 1.0f);
-        float normB = std::clamp(weightedB / totalWeight, 0.0f, 1.0f);
-        mCompensator->setSampledRgb(normR, normG, normB);
-        mRefreshAttempts = 0;
-        return true;
+    if (totalWeight <= 0.0f) {
+        return CaptureResult::kFailed;
     }
 
-    return false;
+    float normR = std::clamp(weightedR / totalWeight, 0.0f, 1.0f);
+    float normG = std::clamp(weightedG / totalWeight, 0.0f, 1.0f);
+    float normB = std::clamp(weightedB / totalWeight, 0.0f, 1.0f);
+    mCompensator->setSampledRgb(normR, normG, normB);
+
+    mConsecutiveErrors = 0;
+    mInitFailures = 0;
+    mRetryAfter = {};
+
+    {
+        std::lock_guard<std::mutex> lock(mControlMutex);
+        if (!mRunning || mPaused || mCaptureGen != currentGen) {
+            return CaptureResult::kAborted;
+        }
+        mInLockout = false;
+        if (hadDispatchLux) {
+            if (mHasLatestRawLux) {
+                mLastTriggerRawLux = dispatchRawLux;
+                mHasRawLuxAnchor = true;
+                mSeedAnchorOnNextSample = false;
+                float threshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
+                                             kMinTriggerDeltaLux, kMaxTriggerDeltaLux);
+                mCaptureRequested = (std::fabs(mLatestRawLux - mLastTriggerRawLux) >= threshold);
+            } else {
+                // Ambient lux crossed >= kMaxBleedRelevantLux mid-capture.
+                mHasRawLuxAnchor = false;
+                mSeedAnchorOnNextSample = false;
+                mCaptureRequested = false;
+            }
+        } else if (mHasLatestRawLux) {
+            mLastTriggerRawLux = mLatestRawLux;
+            mHasRawLuxAnchor = true;
+            mSeedAnchorOnNextSample = false;
+            mCaptureRequested = false;
+        } else {
+            mHasRawLuxAnchor = false;
+            mSeedAnchorOnNextSample = true;
+            mCaptureRequested = false;
+        }
+    }
+
+    return CaptureResult::kSuccess;
 }
 
 void CwbClient::captureWorkerThread() {
     pthread_setname_np(pthread_self(), "UDalsCwbWorker");
 
-    // 5 FPS (200 ms) limits CWB frequency boost while matching ALS integration periods
-    const auto kSampleInterval = std::chrono::milliseconds(200);
-
     while (true) {
+        uint64_t currentGen = 0;
+        bool inLockout = false;
         {
             std::unique_lock<std::mutex> lock(mControlMutex);
             mCv.wait(lock, [this] {
-                return !mRunning || (!mPaused && !mInvalidRoi.load() && hasActiveBacklight());
+                return !mRunning || (!mPaused && !mInvalidRoi.load() && hasActiveBacklight() &&
+                                     (mCaptureRequested || mInLockout));
             });
             if (!mRunning) {
                 break;
             }
+            currentGen = mCaptureGen;
+            inLockout = mInLockout;
         }
 
-        bool refreshTriggered = false;
-        bool sampled = requestCwbSample(&refreshTriggered);
+        if (currentGen != mLastSeenGen) {
+            mInitFailures = 0;
+            mConsecutiveErrors = 0;
+            mHasDispatchedCapture = false;
+            mRetryAfter = {};
+            mLastLockoutProbeTime = {};
+            mLastSeenGen = currentGen;
+        }
 
-        if (mInvalidRoi.load()) {
+        auto now = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::duration waitDuration{};
+        if (inLockout) {
+            if (mLastLockoutProbeTime.time_since_epoch().count() != 0) {
+                auto elapsed = now - mLastLockoutProbeTime;
+                if (elapsed < kLockoutProbeInterval) {
+                    waitDuration = kLockoutProbeInterval - elapsed;
+                }
+            }
+        } else {
+            bool isPending = (mCallbackHandler != nullptr && mCallbackHandler->isPending());
+            if (!isPending && mHasDispatchedCapture) {
+                auto elapsed = now - mLastDispatchTime;
+                if (elapsed < kMinDispatchInterval) {
+                    waitDuration = std::max(waitDuration, kMinDispatchInterval - elapsed);
+                }
+            }
+            if (mRetryAfter.time_since_epoch().count() != 0 && now < mRetryAfter) {
+                waitDuration = std::max(waitDuration, mRetryAfter - now);
+            }
+        }
+
+        if (waitDuration > std::chrono::steady_clock::duration::zero()) {
+            std::unique_lock<std::mutex> lock(mControlMutex);
+            if (mRunning && !mPaused && mCaptureGen == currentGen && mInLockout == inLockout &&
+                (inLockout || mCaptureRequested) && hasActiveBacklight()) {
+                mCv.wait_for(lock, waitDuration, [&] {
+                    return !mRunning || mPaused || mCaptureGen != currentGen ||
+                           mInLockout != inLockout || (!inLockout && !mCaptureRequested) ||
+                           !hasActiveBacklight();
+                });
+            }
+            if (!mRunning) {
+                break;
+            }
             continue;
         }
 
-        bool shouldSkipSleep = false;
+        auto attemptStart = std::chrono::steady_clock::now();
+        CaptureResult result = requestCwbSample(currentGen);
+
+        if (mInvalidRoi.load() || result == CaptureResult::kSuccess ||
+            result == CaptureResult::kAborted) {
+            continue;
+        }
+
+        ++mConsecutiveErrors;
+        bool enterLockout = (mConsecutiveErrors >= kLockoutThreshold);
+        bool clearNow = false;
         {
             std::lock_guard<std::mutex> lock(mControlMutex);
             if (!mRunning) {
                 break;
             }
-            if (!mPaused && !hasActiveBacklight()) {
-                shouldSkipSleep = true;
+            if (!mPaused && mCaptureGen == currentGen) {
+                if (enterLockout) {
+                    if (!mInLockout) {
+                        clearNow = true;
+                        mInLockout = true;
+                    }
+                    mCaptureRequested = false;
+                } else if (!mInLockout) {
+                    mCaptureRequested = true;
+                }
             }
         }
-        if (shouldSkipSleep) {
-            continue;
+
+        if (clearNow && mCompensator != nullptr) {
+            mCompensator->clearSample();
         }
 
-        auto sleepDuration = kSampleInterval;
-        if (mInitFailures >= 15 || mConsecutiveErrors >= 15) {
-            sleepDuration = std::chrono::seconds(5);
-        } else if (refreshTriggered) {
-            // Re-check within ~2 vsyncs so initial wake compensation beats the wake flare gate.
-            sleepDuration = std::chrono::milliseconds(30);
-        } else if (!sampled &&
-                   (mPendingTimeouts > 0 || mConsecutiveErrors > 0 || mInitFailures > 0)) {
-            sleepDuration = (mPendingTimeouts >= 5 || mConsecutiveErrors >= 5 || mInitFailures >= 5)
-                                    ? std::chrono::milliseconds(500)
-                                    : std::chrono::milliseconds(300);
-        }
-
-        std::unique_lock<std::mutex> lock(mControlMutex);
-        mCv.wait_for(lock, sleepDuration, [this] { return !mRunning || mPaused; });
-        if (!mRunning) {
-            break;
+        if (enterLockout) {
+            mLastLockoutProbeTime = std::chrono::steady_clock::now();
+            mRetryAfter = {};
+        } else {
+            mRetryAfter = attemptStart + kMinDispatchInterval;
         }
     }
 }

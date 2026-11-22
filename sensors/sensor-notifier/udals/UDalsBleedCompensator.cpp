@@ -32,7 +32,6 @@ UDalsBleedCompensator::UDalsBleedCompensator()
       mPeakBleedLuxGreen(0.0f),
       mPeakBleedLuxBlue(0.0f),
       mResetTime(std::chrono::steady_clock::now()),
-      mLastSampleTime(),
       mMedianWindow{},
       mMedianCount(0),
       mMedianIndex(0) {
@@ -188,7 +187,14 @@ void UDalsBleedCompensator::reset() {
     mNormG = 0.0f;
     mNormB = 0.0f;
     mResetTime = std::chrono::steady_clock::now();
-    mLastSampleTime = std::chrono::steady_clock::time_point{};
+}
+
+void UDalsBleedCompensator::clearSample() {
+    std::lock_guard<std::mutex> lock(mLock);
+    mHasSample = false;
+    mNormR = 0.0f;
+    mNormG = 0.0f;
+    mNormB = 0.0f;
 }
 
 void UDalsBleedCompensator::setBacklight(uint32_t brightness) {
@@ -223,7 +229,6 @@ void UDalsBleedCompensator::setSampledRgb(float r, float g, float b) {
     }
     mHasSample = true;
     mWakeGateActive = false;
-    mLastSampleTime = std::chrono::steady_clock::now();
 }
 
 float UDalsBleedCompensator::interpolateTable(const std::vector<CaliPoint>& table,
@@ -254,21 +259,8 @@ float UDalsBleedCompensator::interpolateTable(const std::vector<CaliPoint>& tabl
 }
 
 float UDalsBleedCompensator::calculateBleedLuxLocked() const {
-    if (mBacklight == 0 || !mHasSample || mLastSampleTime.time_since_epoch().count() == 0) {
+    if (mBacklight == 0 || !mHasSample) {
         return 0.0f;
-    }
-
-    auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - mLastSampleTime)
-                         .count();
-    float stalenessFactor = 1.0f;
-    if (ageMs > 1500) {
-        // Decay gradually rather than snapping to zero during temporary CWB lockouts
-        // (e.g., DRM or virtual displays), fading completely out after 5 s.
-        if (ageMs >= 6500) {
-            return 0.0f;
-        }
-        stalenessFactor = 1.0f - static_cast<float>(ageMs - 1500) / 5000.0f;
     }
 
     if (mNormR <= 0.001f && mNormG <= 0.001f && mNormB <= 0.001f) {
@@ -306,11 +298,11 @@ float UDalsBleedCompensator::calculateBleedLuxLocked() const {
     float bleedG = mNormG * curveG * mPeakBleedLuxGreen;
     float bleedB = mNormB * curveB * mPeakBleedLuxBlue;
 
-    return std::max(0.0f, (bleedR + bleedG + bleedB) * stalenessFactor);
+    return std::max(0.0f, bleedR + bleedG + bleedB);
 }
 
 bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
-    if (outLux == nullptr) {
+    if (outLux == nullptr || !std::isfinite(rawLux) || rawLux < 0.0f) {
         return false;
     }
 

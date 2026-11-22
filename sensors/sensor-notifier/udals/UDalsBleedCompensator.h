@@ -38,6 +38,7 @@ class UDalsBleedCompensator {
     bool loadConfig(const std::string& path, UdalsGeometry* outGeo);
 
     void reset();
+    void clearSample();
     void setBacklight(uint32_t brightness);
     void setSampledRgb(float r, float g, float b);
     bool compensate(float rawLux, float* outLux);
@@ -61,7 +62,6 @@ class UDalsBleedCompensator {
     float mPeakBleedLuxGreen;
     float mPeakBleedLuxBlue;
     std::chrono::steady_clock::time_point mResetTime{};
-    std::chrono::steady_clock::time_point mLastSampleTime{};
 
     std::vector<CaliPoint> mNormalDataR;
     std::vector<CaliPoint> mNormalDataG;

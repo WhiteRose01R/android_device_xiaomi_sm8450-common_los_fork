@@ -32,15 +32,22 @@ class CwbClient {
     bool start();
     void stop();
     void notifyBacklightChanged();
+    void onRawLuxSample(float rawLux);
 
   private:
+    enum class CaptureResult {
+        kSuccess,
+        kFailed,
+        kAborted,
+    };
+
     void captureWorkerThread();
     bool hasActiveBacklight() const;
     bool isActiveGen(uint64_t gen) const;
     bool ensureCwbInitializedWorker();
     void releaseCwbWorker(bool freeBuffer);
     void triggerRefreshWorker();
-    bool requestCwbSample(bool* outRefreshTriggered);
+    CaptureResult requestCwbSample(uint64_t currentGen);
     void computeWeightedRgb(const uint8_t* pixels, float* outR, float* outG, float* outB,
                             float* outTotalWeight) const;
 
@@ -61,6 +68,13 @@ class CwbClient {
     bool mRunning = false;
     bool mPaused = true;
     uint64_t mCaptureGen = 0;
+    bool mCaptureRequested = false;
+    bool mInLockout = false;
+    bool mHasLatestRawLux = false;
+    float mLatestRawLux = 0.0f;
+    bool mHasRawLuxAnchor = false;
+    float mLastTriggerRawLux = 0.0f;
+    bool mSeedAnchorOnNextSample = false;
     std::shared_ptr<CwbCallbackHandler> mActiveCallback;
     std::thread mWorker;
 
@@ -73,8 +87,10 @@ class CwbClient {
     uint32_t mBufferStride = 0;
     bool mDisplayBoundsChecked = false;
     uint32_t mInitFailures = 0;
-    uint32_t mPendingTimeouts = 0;
     uint32_t mConsecutiveErrors = 0;
-    uint32_t mRefreshAttempts = 0;
+    bool mHasDispatchedCapture = false;
     std::chrono::steady_clock::time_point mLastInitAttempt{};
+    std::chrono::steady_clock::time_point mLastDispatchTime{};
+    std::chrono::steady_clock::time_point mRetryAfter{};
+    std::chrono::steady_clock::time_point mLastLockoutProbeTime{};
 };
