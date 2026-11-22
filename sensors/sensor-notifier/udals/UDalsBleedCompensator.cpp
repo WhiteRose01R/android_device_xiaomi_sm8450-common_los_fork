@@ -31,10 +31,7 @@ UDalsBleedCompensator::UDalsBleedCompensator()
       mPeakBleedLuxRed(0.0f),
       mPeakBleedLuxGreen(0.0f),
       mPeakBleedLuxBlue(0.0f),
-      mResetTime(std::chrono::steady_clock::now()),
-      mMedianWindow{},
-      mMedianCount(0),
-      mMedianIndex(0) {
+      mResetTime(std::chrono::steady_clock::now()) {
     std::string bleedProp =
             android::base::GetProperty("ro.vendor.sensors.notifier.udals.max_bleed_rgb", "");
     if (!bleedProp.empty()) {
@@ -177,9 +174,6 @@ bool UDalsBleedCompensator::loadConfig(const std::string& path, UdalsGeometry* o
 
 void UDalsBleedCompensator::reset() {
     std::lock_guard<std::mutex> lock(mLock);
-    mMedianWindow.fill(0.0f);
-    mMedianCount = 0;
-    mMedianIndex = 0;
     mBacklight = 0;
     mHasSample = false;
     mWakeGateActive = true;
@@ -222,11 +216,6 @@ void UDalsBleedCompensator::setSampledRgb(float r, float g, float b) {
     mNormR = std::clamp(r, 0.0f, 1.0f);
     mNormG = std::clamp(g, 0.0f, 1.0f);
     mNormB = std::clamp(b, 0.0f, 1.0f);
-    if (!mHasSample) {
-        mMedianWindow.fill(0.0f);
-        mMedianCount = 0;
-        mMedianIndex = 0;
-    }
     mHasSample = true;
     mWakeGateActive = false;
 }
@@ -320,17 +309,6 @@ bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
     }
 
     float bleed = calculateBleedLuxLocked();
-    float compensated = std::max(0.0f, rawLux - bleed);
-
-    mMedianWindow[mMedianIndex] = compensated;
-    mMedianIndex = (mMedianIndex + 1) % mMedianWindow.size();
-    if (mMedianCount < mMedianWindow.size()) {
-        mMedianCount++;
-    }
-
-    auto temp = mMedianWindow;
-    size_t medianIdx = (mMedianCount - 1) / 2;
-    std::nth_element(temp.begin(), temp.begin() + medianIdx, temp.begin() + mMedianCount);
-    *outLux = temp[medianIdx];
+    *outLux = std::max(0.0f, rawLux - bleed);
     return true;
 }
