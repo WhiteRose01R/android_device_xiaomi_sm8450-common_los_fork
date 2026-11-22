@@ -78,6 +78,8 @@ class CwbClient {
     bool mHasRawLuxAnchor = false;
     float mLastTriggerRawLux = 0.0f;
     bool mSeedAnchorOnNextSample = false;
+    uint32_t mSustainedDeltaCount = 0;
+    int8_t mSustainedDeltaSign = 0;
     std::shared_ptr<CwbCallbackHandler> mActiveCallback;
     std::thread mWorker;
 

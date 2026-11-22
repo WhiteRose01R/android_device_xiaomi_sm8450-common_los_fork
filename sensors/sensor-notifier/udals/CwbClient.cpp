@@ -28,6 +28,8 @@ namespace {
 constexpr uint32_t kPrimaryDisplayId = static_cast<uint32_t>(DisplayConfig::DisplayType::kPrimary);
 constexpr float kMaxBleedRelevantLux = 15000.0f;
 constexpr float kMinTriggerDeltaLux = 1.5f;
+constexpr float kSustainedMinTriggerDeltaLux = 0.40f;
+constexpr uint32_t kSustainedLowLuxSamples = 2u;
 constexpr float kMaxTriggerDeltaLux = 250.0f;
 constexpr float kTriggerRelativeDelta = 0.08f;
 constexpr auto kMinDispatchInterval = std::chrono::milliseconds(250);
@@ -257,6 +259,8 @@ void CwbClient::onRawLuxSample(float rawLux) {
             mHasLatestRawLux = false;
             mHasRawLuxAnchor = false;
             mSeedAnchorOnNextSample = false;
+            mSustainedDeltaCount = 0;
+            mSustainedDeltaSign = 0;
             mCaptureRequested = false;
             shouldNotify = changed;
         } else {
@@ -265,19 +269,49 @@ void CwbClient::onRawLuxSample(float rawLux) {
             mLatestRawLux = rawLux;
             mHasLatestRawLux = true;
             if (mInLockout) {
+                mSustainedDeltaCount = 0;
+                mSustainedDeltaSign = 0;
                 shouldNotify = resumedFromHighLux;
             } else if (mSeedAnchorOnNextSample) {
                 mLastTriggerRawLux = rawLux;
                 mHasRawLuxAnchor = true;
                 mSeedAnchorOnNextSample = false;
+                mSustainedDeltaCount = 0;
+                mSustainedDeltaSign = 0;
             } else {
-                float threshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
-                                             kMinTriggerDeltaLux, kMaxTriggerDeltaLux);
-                if (!mHasRawLuxAnchor || std::fabs(rawLux - mLastTriggerRawLux) >= threshold) {
-                    if (!mCaptureRequested) {
-                        mCaptureRequested = true;
-                        shouldNotify = true;
+                float delta = rawLux - mLastTriggerRawLux;
+                float absDelta = std::fabs(delta);
+                float immediateThreshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
+                                                      kMinTriggerDeltaLux, kMaxTriggerDeltaLux);
+                float sustainedThreshold =
+                        std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
+                                   kSustainedMinTriggerDeltaLux, kMaxTriggerDeltaLux);
+                bool shouldTrigger = false;
+                if (!mHasRawLuxAnchor || absDelta >= immediateThreshold) {
+                    mSustainedDeltaCount = 0;
+                    mSustainedDeltaSign = 0;
+                    shouldTrigger = true;
+                } else if (absDelta >= sustainedThreshold) {
+                    int8_t sign = (delta > 0.0f) ? 1 : -1;
+                    if (sign == mSustainedDeltaSign) {
+                        mSustainedDeltaCount++;
+                    } else {
+                        mSustainedDeltaSign = sign;
+                        mSustainedDeltaCount = 1;
                     }
+                    if (mSustainedDeltaCount >= kSustainedLowLuxSamples) {
+                        mSustainedDeltaCount = 0;
+                        mSustainedDeltaSign = 0;
+                        shouldTrigger = true;
+                    }
+                } else {
+                    mSustainedDeltaCount = 0;
+                    mSustainedDeltaSign = 0;
+                }
+
+                if (shouldTrigger && !mCaptureRequested) {
+                    mCaptureRequested = true;
+                    shouldNotify = true;
                 }
             }
         }
@@ -459,6 +493,8 @@ bool CwbClient::start() {
         mHasRawLuxAnchor = false;
         mLastTriggerRawLux = 0.0f;
         mSeedAnchorOnNextSample = false;
+        mSustainedDeltaCount = 0;
+        mSustainedDeltaSign = 0;
         mCaptureRequested = true;
         cb = mActiveCallback;
         if (!mRunning) {
@@ -490,6 +526,8 @@ void CwbClient::stop() {
         mHasRawLuxAnchor = false;
         mLastTriggerRawLux = 0.0f;
         mSeedAnchorOnNextSample = false;
+        mSustainedDeltaCount = 0;
+        mSustainedDeltaSign = 0;
         gen = ++mCaptureGen;
         cb = mActiveCallback;
     }
@@ -558,6 +596,8 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
         }
         hadDispatchLux = mHasLatestRawLux;
         dispatchRawLux = mLatestRawLux;
+        mSustainedDeltaCount = 0;
+        mSustainedDeltaSign = 0;
         mCaptureRequested = false;
     }
 
@@ -692,23 +732,46 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
                 mLastTriggerRawLux = dispatchRawLux;
                 mHasRawLuxAnchor = true;
                 mSeedAnchorOnNextSample = false;
-                float threshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
-                                             kMinTriggerDeltaLux, kMaxTriggerDeltaLux);
-                mCaptureRequested = (std::fabs(mLatestRawLux - mLastTriggerRawLux) >= threshold);
+                float delta = mLatestRawLux - mLastTriggerRawLux;
+                float absDelta = std::fabs(delta);
+                float immediateThreshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
+                                                      kMinTriggerDeltaLux, kMaxTriggerDeltaLux);
+                float sustainedThreshold =
+                        std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
+                                   kSustainedMinTriggerDeltaLux, kMaxTriggerDeltaLux);
+                if (absDelta >= immediateThreshold) {
+                    mCaptureRequested = true;
+                    mSustainedDeltaCount = 0;
+                    mSustainedDeltaSign = 0;
+                } else if (absDelta >= sustainedThreshold) {
+                    mCaptureRequested = false;
+                    mSustainedDeltaSign = (delta > 0.0f) ? 1 : -1;
+                    mSustainedDeltaCount = 1;
+                } else {
+                    mCaptureRequested = false;
+                    mSustainedDeltaCount = 0;
+                    mSustainedDeltaSign = 0;
+                }
             } else {
                 // Ambient lux crossed >= kMaxBleedRelevantLux mid-capture.
                 mHasRawLuxAnchor = false;
                 mSeedAnchorOnNextSample = false;
+                mSustainedDeltaCount = 0;
+                mSustainedDeltaSign = 0;
                 mCaptureRequested = false;
             }
         } else if (mHasLatestRawLux) {
             mLastTriggerRawLux = mLatestRawLux;
             mHasRawLuxAnchor = true;
             mSeedAnchorOnNextSample = false;
+            mSustainedDeltaCount = 0;
+            mSustainedDeltaSign = 0;
             mCaptureRequested = false;
         } else {
             mHasRawLuxAnchor = false;
             mSeedAnchorOnNextSample = true;
+            mSustainedDeltaCount = 0;
+            mSustainedDeltaSign = 0;
             mCaptureRequested = false;
         }
     }
