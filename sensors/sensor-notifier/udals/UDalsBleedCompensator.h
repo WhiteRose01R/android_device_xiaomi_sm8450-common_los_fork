@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -71,8 +70,4 @@ class UDalsBleedCompensator {
     std::vector<CaliPoint> mDcDataR;
     std::vector<CaliPoint> mDcDataG;
     std::vector<CaliPoint> mDcDataB;
-
-    std::array<float, 5> mMedianWindow;
-    size_t mMedianCount;
-    size_t mMedianIndex;
 };
