@@ -81,7 +81,10 @@ class CwbClient {
     bool mSeedAnchorOnNextSample = false;
     uint32_t mSustainedDeltaCount = 0;
     int8_t mSustainedDeltaSign = 0;
-    bool mUpwardCapturePending = false;
+    int8_t mPendingTransitionDir = 0;
+    uint32_t mLockoutProbeShift = 0;
+    std::chrono::steady_clock::time_point mLatestRawLuxTime{};
+    std::chrono::steady_clock::time_point mSustainedStartTime{};
     std::shared_ptr<CwbCallbackHandler> mActiveCallback;
     std::thread mWorker;
 

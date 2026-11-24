@@ -29,12 +29,12 @@ constexpr auto kBacklightRampDownHold = std::chrono::milliseconds(150);
 constexpr size_t kMaxBacklightHistoryEntries = 64;
 constexpr float kTransitionBleedCeilingFactor = 1.5f;
 constexpr float kTransitionBleedCeilingMarginLux = 5.0f;
-constexpr float kLowGammaKneeFraction = 0.022f;
+constexpr float kLowGammaKneeFraction = 0.025f;
 constexpr size_t kResidualMedianWindow = 5;
 constexpr float kLowLuxFilterCeiling = 5.0f;
 constexpr float kLowLuxEmaCeiling = 3.0f;
 constexpr float kEmaStepBypassDelta = 1.5f;
-constexpr float kLowLuxEmaAlpha = 0.25f;
+constexpr float kLowLuxEmaTauSeconds = 0.35f;
 
 }  // namespace
 
@@ -43,7 +43,7 @@ UDalsBleedCompensator::UDalsBleedCompensator()
       mNormalMaxBacklight(2047u),
       mHasSample(false),
       mWakeGateActive(false),
-      mTransitionHoldActive(false),
+      mTransitionHoldDir(0),
       mTransitionHoldTimedOut(false),
       mHasSettledOutput(false),
       mHasResidualEma(false),
@@ -55,6 +55,7 @@ UDalsBleedCompensator::UDalsBleedCompensator()
       mNormLowG(0.0f),
       mNormLowB(0.0f),
       mLastSettledCompLux(0.0f),
+      mTransitionAnchorRawLux(0.0f),
       mResidualEma(0.0f),
       mPeakBleedLuxRed(0.0f),
       mPeakBleedLuxGreen(0.0f),
@@ -205,10 +206,11 @@ void UDalsBleedCompensator::reset() {
     mBacklight = 0;
     mHasSample = false;
     mWakeGateActive = true;
-    mTransitionHoldActive = false;
+    mTransitionHoldDir = 0;
     mTransitionHoldTimedOut = false;
     mHasSettledOutput = false;
     mLastSettledCompLux = 0.0f;
+    mTransitionAnchorRawLux = 0.0f;
     ++mSampleSeq;
     mNormR = 0.0f;
     mNormG = 0.0f;
@@ -224,8 +226,9 @@ void UDalsBleedCompensator::reset() {
 void UDalsBleedCompensator::clearSample() {
     std::lock_guard<std::mutex> lock(mLock);
     mHasSample = false;
-    mTransitionHoldActive = false;
+    mTransitionHoldDir = 0;
     mTransitionHoldTimedOut = false;
+    mTransitionAnchorRawLux = 0.0f;
     ++mSampleSeq;
     mNormR = 0.0f;
     mNormG = 0.0f;
@@ -306,19 +309,39 @@ void UDalsBleedCompensator::setSampledRgb(float rHigh, float gHigh, float bHigh,
     mNormLowB = std::clamp(bLow, 0.0f, 1.0f);
     mHasSample = true;
     mWakeGateActive = false;
-    mTransitionHoldActive = false;
+    mTransitionHoldDir = 0;
     mTransitionHoldTimedOut = false;
+    mTransitionAnchorRawLux = 0.0f;
     ++mSampleSeq;
 }
 
-void UDalsBleedCompensator::updateTransitionHold(bool upwardPending, float rawLux,
-                                                 uint64_t expectedSeq) {
+bool UDalsBleedCompensator::isTransitionBleedPlausibleLocked(int8_t dir, uint32_t effBkl,
+                                                             float rawLux,
+                                                             float anchorRawLux) const {
+    if (dir > 0) {
+        float maxWhiteBleed = calculateMaxWhiteBleedLocked(effBkl);
+        return rawLux <=
+               maxWhiteBleed * kTransitionBleedCeilingFactor + kTransitionBleedCeilingMarginLux;
+    }
+    if (dir < 0) {
+        float currentBleed = calculateBleedLuxLocked(effBkl);
+        if (currentBleed <= 0.0f) {
+            return false;
+        }
+        float drop = anchorRawLux - rawLux;
+        return rawLux < currentBleed || drop <= currentBleed * kTransitionBleedCeilingFactor +
+                                                        kTransitionBleedCeilingMarginLux;
+    }
+    return false;
+}
+
+void UDalsBleedCompensator::updateTransitionHold(int8_t pendingDir, float rawLux,
+                                                 float anchorRawLux, uint64_t expectedSeq) {
     std::lock_guard<std::mutex> lock(mLock);
-    if (!upwardPending) {
-        // Clear immediately when an aborted 1-sample sustained rise drops back below threshold
-        // or no upward CWB capture is pending.
-        mTransitionHoldActive = false;
+    if (pendingDir == 0) {
+        mTransitionHoldDir = 0;
         mTransitionHoldTimedOut = false;
+        mTransitionAnchorRawLux = 0.0f;
         return;
     }
 
@@ -327,26 +350,56 @@ void UDalsBleedCompensator::updateTransitionHold(bool upwardPending, float rawLu
         return;
     }
 
+    int8_t normalizedDir = (pendingDir > 0) ? 1 : -1;
+    if (mTransitionHoldDir != 0 && mTransitionHoldDir != normalizedDir) {
+        mTransitionHoldDir = 0;
+        mTransitionHoldTimedOut = false;
+    }
+
     auto now = std::chrono::steady_clock::now();
     uint32_t effBkl = effectiveBacklightLocked(now);
-    float maxWhiteBleed = calculateMaxWhiteBleedLocked(effBkl);
-    if (rawLux > maxWhiteBleed * kTransitionBleedCeilingFactor + kTransitionBleedCeilingMarginLux) {
-        // Unambiguously ambient light (room light / flashlight): never delay.
-        mTransitionHoldActive = false;
+    float effAnchor =
+            (mTransitionHoldDir == normalizedDir) ? mTransitionAnchorRawLux : anchorRawLux;
+    if (!isTransitionBleedPlausibleLocked(normalizedDir, effBkl, rawLux, effAnchor)) {
+        // Unambiguous room-light step: release hold immediately.
+        mTransitionHoldDir = 0;
         mTransitionHoldTimedOut = false;
+        mTransitionAnchorRawLux = 0.0f;
         return;
     }
 
-    if (!mTransitionHoldActive && !mTransitionHoldTimedOut) {
-        mTransitionHoldActive = true;
+    if (mTransitionHoldDir == 0 && !mTransitionHoldTimedOut) {
+        mTransitionHoldDir = normalizedDir;
+        mTransitionAnchorRawLux = anchorRawLux;
         mTransitionHoldStart = now;
     }
 }
 
 void UDalsBleedCompensator::clearTransitionHold() {
     std::lock_guard<std::mutex> lock(mLock);
-    mTransitionHoldActive = false;
+    mTransitionHoldDir = 0;
     mTransitionHoldTimedOut = false;
+    mTransitionAnchorRawLux = 0.0f;
+}
+
+bool UDalsBleedCompensator::isUnambiguousAmbient(float rawLux) const {
+    if (!std::isfinite(rawLux) || rawLux <= 0.0f) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mLock);
+    if (mBacklight == 0) {
+        return rawLux > kTransitionBleedCeilingMarginLux;
+    }
+    auto now = std::chrono::steady_clock::now();
+    uint32_t peak = mBacklight;
+    for (const auto& entry : mBacklightHistory) {
+        if ((now - entry.endTime) < kBacklightRampDownHold) {
+            peak = std::max(peak, entry.brightness);
+        }
+    }
+    float maxWhiteBleed = calculateMaxWhiteBleedLocked(peak);
+    return rawLux >
+           maxWhiteBleed * kTransitionBleedCeilingFactor + kTransitionBleedCeilingMarginLux;
 }
 
 float UDalsBleedCompensator::interpolateTable(const std::vector<CaliPoint>& table,
@@ -425,13 +478,15 @@ float UDalsBleedCompensator::calculateBleedLuxLocked(uint32_t effectiveBacklight
         return 0.0f;
     }
 
-    // Blend per-pixel high-BKL (gamma 2.0) and low-BKL (gamma 1.6) linear bases to model
-    // AMOLED low-DBV shadow lift while staying exact on pure black, white, and B/W icons.
+    // Blend per-pixel high-BKL (gamma 2.0) and low-BKL (gamma 1.6) linear bases via a 1.5-order
+    // Hill knee to model AMOLED low-DBV shadow lift with fast high-BKL decay while staying exact
+    // on pure black, white, and B/W icons.
     float knee = (mNormalMaxBacklight > 0)
                          ? std::max(1.0f,
                                     kLowGammaKneeFraction * static_cast<float>(mNormalMaxBacklight))
-                         : 45.0f;
-    float lowBlend = 1.0f / (1.0f + static_cast<float>(effectiveBacklight) / knee);
+                         : 51.0f;
+    float r = static_cast<float>(effectiveBacklight) / knee;
+    float lowBlend = 1.0f / (1.0f + r * std::sqrt(r));
     float effR = mNormR + lowBlend * (mNormLowR - mNormR);
     float effG = mNormG + lowBlend * (mNormLowG - mNormG);
     float effB = mNormB + lowBlend * (mNormLowB - mNormB);
@@ -447,16 +502,40 @@ void UDalsBleedCompensator::resetResidualFilterLocked() {
     mResidualWindow.clear();
     mHasResidualEma = false;
     mResidualEma = 0.0f;
+    mLastResidualSampleTime = {};
 }
 
-float UDalsBleedCompensator::filterSignedResidualLocked(float signedRes, float bleed) {
-    // Pass bright ambient light (>= 5 lux) or zero-bleed frames straight through without lag.
-    if (bleed <= 0.0f || (mHasResidualEma && mResidualEma >= kLowLuxFilterCeiling &&
-                          signedRes >= kLowLuxFilterCeiling)) {
-        mResidualWindow.clear();
+float UDalsBleedCompensator::filterSignedResidualLocked(float signedRes, float bleed,
+                                                        std::chrono::steady_clock::time_point now) {
+    if (bleed <= 0.0f) {
+        if (mHasResidualEma && std::fabs(signedRes - mResidualEma) > kEmaStepBypassDelta) {
+            mResidualWindow.clear();
+        }
         mResidualWindow.push_back(signedRes);
+        while (mResidualWindow.size() > kResidualMedianWindow) {
+            mResidualWindow.pop_front();
+        }
         mResidualEma = signedRes;
         mHasResidualEma = true;
+        mLastResidualSampleTime = now;
+        return std::max(0.0f, signedRes);
+    }
+
+    // Pass bright ambient light (>= 5 lux) straight through without lag while preserving the
+    // 5-sample window so downward pre-CWB dips cannot poison Median-5/EMA.
+    if (mHasResidualEma && mResidualEma >= kLowLuxFilterCeiling &&
+        signedRes >= kLowLuxFilterCeiling) {
+        if (signedRes < mResidualEma - kEmaStepBypassDelta) {
+            for (float& val : mResidualWindow) {
+                val = std::min(val, signedRes);
+            }
+        }
+        mResidualWindow.push_back(signedRes);
+        while (mResidualWindow.size() > kResidualMedianWindow) {
+            mResidualWindow.pop_front();
+        }
+        mResidualEma = signedRes;
+        mLastResidualSampleTime = now;
         return std::max(0.0f, signedRes);
     }
 
@@ -478,12 +557,16 @@ float UDalsBleedCompensator::filterSignedResidualLocked(float signedRes, float b
     // Evaluate EMA step-bypass strictly on the Median-5 output so 1-2 sample spikes > 1.5 lux
     // remain blocked while genuine ambient steps snap cleanly once they pass Median-5.
     if (!mHasResidualEma || std::fabs(med - mResidualEma) > kEmaStepBypassDelta ||
-        med >= kLowLuxEmaCeiling) {
+        med >= kLowLuxEmaCeiling || mLastResidualSampleTime.time_since_epoch().count() == 0) {
         mResidualEma = med;
         mHasResidualEma = true;
     } else {
-        mResidualEma = kLowLuxEmaAlpha * med + (1.0f - kLowLuxEmaAlpha) * mResidualEma;
+        float dtSec = std::chrono::duration<float>(now - mLastResidualSampleTime).count();
+        dtSec = std::clamp(dtSec, 0.005f, 2.0f);
+        float alpha = 1.0f - std::exp(-dtSec / kLowLuxEmaTauSeconds);
+        mResidualEma = alpha * med + (1.0f - alpha) * mResidualEma;
     }
+    mLastResidualSampleTime = now;
 
     return std::max(0.0f, mResidualEma);
 }
@@ -506,26 +589,26 @@ bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
 
     uint32_t effBkl = effectiveBacklightLocked(now);
 
-    // Hold last settled compensated lux while a bleed-plausible upward CWB capture is pending
-    // so Xiaomi's SSC receives a steady 10 Hz stream without pre-CWB dark->bright spikes.
-    if (mTransitionHoldActive) {
-        float maxWhiteBleed = calculateMaxWhiteBleedLocked(effBkl);
+    // Hold last settled compensated lux while a bleed-plausible upward or downward CWB capture is
+    // pending so Xiaomi's SSC receives a steady stream without pre-CWB spikes or 0-lux plunges.
+    if (mTransitionHoldDir != 0) {
         auto elapsed = now - mTransitionHoldStart;
         if (mHasSample && effBkl > 0 && mHasSettledOutput &&
-            rawLux <= maxWhiteBleed * kTransitionBleedCeilingFactor +
-                              kTransitionBleedCeilingMarginLux &&
+            isTransitionBleedPlausibleLocked(mTransitionHoldDir, effBkl, rawLux,
+                                             mTransitionAnchorRawLux) &&
             elapsed < kTransitionHoldTimeout) {
             *outLux = std::min(mLastSettledCompLux, rawLux);
             return true;
         }
-        mTransitionHoldActive = false;
+        mTransitionHoldDir = 0;
+        mTransitionAnchorRawLux = 0.0f;
         if (elapsed >= kTransitionHoldTimeout) {
             mTransitionHoldTimedOut = true;
         }
     }
 
     float bleed = calculateBleedLuxLocked(effBkl);
-    float filtered = filterSignedResidualLocked(rawLux - bleed, bleed);
+    float filtered = filterSignedResidualLocked(rawLux - bleed, bleed, now);
     mLastSettledCompLux = filtered;
     mHasSettledOutput = true;
     *outLux = filtered;

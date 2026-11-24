@@ -16,6 +16,7 @@
 #include <android-base/unique_fd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <unistd.h>
 #include <cerrno>
 #include <vector>
 
@@ -202,9 +203,17 @@ RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
     UdalsGeometry geo;
 
     static constexpr const char* kConfigPaths[] = {
-            "/vendor/etc/sensors/config/lightSensorConfig.json",
             "/odm/etc/sensors/config/lightSensorConfig.json",
+            "/vendor/etc/sensors/config/lightSensorConfig.json",
     };
+
+    int wakeFds[2] = {-1, -1};
+    if (pipe2(wakeFds, O_CLOEXEC | O_NONBLOCK) == 0) {
+        mWakeReadFd.reset(wakeFds[0]);
+        mWakeWriteFd.reset(wakeFds[1]);
+    } else {
+        PLOG(WARNING) << "Failed to create RawLightNotifier wake pipe";
+    }
 
     bool loaded = false;
     for (const char* path : kConfigPaths) {
@@ -231,6 +240,12 @@ RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
 
 RawLightNotifier::~RawLightNotifier() {
     mActive = false;
+    if (mWakeWriteFd.get() != -1) {
+        const uint8_t wakeByte = 1;
+        ssize_t ignored =
+                TEMP_FAILURE_RETRY(write(mWakeWriteFd.get(), &wakeByte, sizeof(wakeByte)));
+        (void)ignored;
+    }
     deactivate();
     if (mCwbClient != nullptr) {
         mCwbClient->stop();
@@ -259,9 +274,17 @@ void RawLightNotifier::notify() {
 
     std::vector<struct pollfd> pollfds;
     pollfds.push_back({.fd = powerFd.get(), .events = POLLERR | POLLPRI, .revents = POLLPRI});
+    int dbvIdx = -1;
     if (dbvFd.get() != -1) {
+        dbvIdx = static_cast<int>(pollfds.size());
         pollfds.push_back({.fd = dbvFd.get(), .events = POLLERR | POLLPRI, .revents = POLLPRI});
     }
+    int wakeIdx = -1;
+    if (mWakeReadFd.get() != -1) {
+        wakeIdx = static_cast<int>(pollfds.size());
+        pollfds.push_back({.fd = mWakeReadFd.get(), .events = POLLIN, .revents = 0});
+    }
+    int pollTimeoutMs = (wakeIdx >= 0) ? -1 : 500;
 
     bool displayOn = false;
     bool powerEventSeen = false;
@@ -305,6 +328,15 @@ void RawLightNotifier::notify() {
     };
 
     while (mActive) {
+        if (wakeIdx >= 0 && (pollfds[static_cast<size_t>(wakeIdx)].revents & POLLIN)) {
+            uint8_t buf[16];
+            while (read(mWakeReadFd.get(), buf, sizeof(buf)) > 0) {
+            }
+            if (!mActive) {
+                break;
+            }
+        }
+
         if (pollfds[0].revents & (POLLERR | POLLPRI)) {
             int powerVal = 0;
             if (readInt(pollfds[0].fd, &powerVal)) {
@@ -320,9 +352,9 @@ void RawLightNotifier::notify() {
             }
         }
 
-        if (pollfds.size() > 1 && (pollfds[1].revents & (POLLERR | POLLPRI))) {
+        if (dbvIdx >= 0 && (pollfds[static_cast<size_t>(dbvIdx)].revents & (POLLERR | POLLPRI))) {
             int dbvVal = 0;
-            if (readInt(pollfds[1].fd, &dbvVal) && dbvVal >= 0) {
+            if (readInt(pollfds[static_cast<size_t>(dbvIdx)].fd, &dbvVal) && dbvVal >= 0) {
                 if (!displayOn) {
                     // Fallback for unpatched 6.6 kernels that leave panel_power_state at
                     // OFF (5) after continuous splash until first lock/unlock; AOD uses LP1/LP2.
@@ -335,7 +367,11 @@ void RawLightNotifier::notify() {
                         }
                     }
                 } else {
-                    updateBacklight(static_cast<uint32_t>(dbvVal));
+                    if (!powerEventSeen && lastPowerVal == kPanelPowerOff && dbvVal == 0) {
+                        enterDisplayOff();
+                    } else {
+                        updateBacklight(static_cast<uint32_t>(dbvVal));
+                    }
                 }
             }
         }
@@ -346,7 +382,7 @@ void RawLightNotifier::notify() {
             pfd.revents = 0;
         }
 
-        int rc = poll(pollfds.data(), pollfds.size(), 500);
+        int rc = poll(pollfds.data(), pollfds.size(), pollTimeoutMs);
         if (rc < 0 && errno != EINTR) {
             PLOG(ERROR) << "failed to poll display nodes";
         }

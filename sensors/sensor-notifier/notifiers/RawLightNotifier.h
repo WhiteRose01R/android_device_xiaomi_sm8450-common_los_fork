@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <android-base/unique_fd.h>
 #include <atomic>
 #include <memory>
 
@@ -32,6 +33,8 @@ class RawLightNotifier : public SensorNotifier {
     std::atomic<bool> mEnabled;
     bool mBacklightScaleResolved;
     uint32_t mDeviceNormalMaxBacklight;
+    android::base::unique_fd mWakeReadFd;
+    android::base::unique_fd mWakeWriteFd;
     std::shared_ptr<UDalsBleedCompensator> mCompensator;
     std::shared_ptr<CwbClient> mCwbClient;
 };
