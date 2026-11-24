@@ -12,6 +12,9 @@
 #include <aidl/vendor/qti/hardware/display/config/IDisplayConfig.h>
 #include <aidlcommonsupport/NativeHandle.h>
 #include <android-base/logging.h>
+#include <android-base/parsedouble.h>
+#include <android-base/properties.h>
+#include <android-base/strings.h>
 #include <android/binder_manager.h>
 #include <android/binder_process.h>
 #include <android/hardware_buffer.h>
@@ -46,15 +49,46 @@ constexpr float kSustainedMinTriggerDeltaLux = 0.40f;
 constexpr uint32_t kSustainedLowLuxSamples = 2u;
 constexpr float kMaxTriggerDeltaLux = 250.0f;
 constexpr float kTriggerRelativeDelta = 0.08f;
-constexpr auto kMinDispatchInterval = std::chrono::milliseconds(250);
+constexpr auto kMinDispatchInterval = std::chrono::milliseconds(100);
+constexpr auto kRetryBackoffInterval = std::chrono::milliseconds(250);
 constexpr auto kInitialWaitTimeout = std::chrono::milliseconds(100);
 constexpr auto kPokeWaitTimeout = std::chrono::milliseconds(100);
 constexpr auto kDrainTimeout = std::chrono::milliseconds(150);
 constexpr auto kLockoutProbeInterval = std::chrono::seconds(2);
 constexpr uint32_t kLockoutThreshold = 3u;
 
+constexpr std::array<float, 3> kDefaultRingWeights = {0.68f, 0.20f, 0.12f};
+
 constexpr float kGammaHigh = 2.0f;
 constexpr float kGammaLow = 1.6f;
+
+std::array<float, 3> loadRingWeights() {
+    std::string prop =
+            android::base::GetProperty("ro.vendor.sensors.notifier.udals.ring_weights", "");
+    if (prop.empty()) {
+        return kDefaultRingWeights;
+    }
+
+    auto parts = android::base::Split(prop, ",");
+    float w0 = 0.0f, w1 = 0.0f, w2 = 0.0f;
+    if (parts.size() == 3 && android::base::ParseFloat(android::base::Trim(parts[0]), &w0) &&
+        android::base::ParseFloat(android::base::Trim(parts[1]), &w1) &&
+        android::base::ParseFloat(android::base::Trim(parts[2]), &w2) && std::isfinite(w0) &&
+        std::isfinite(w1) && std::isfinite(w2) && w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+        float sum = w0 + w1 + w2;
+        if (std::isfinite(sum) && sum > 0.0f) {
+            std::array<float, 3> normalized = {w0 / sum, w1 / sum, w2 / sum};
+            LOG(INFO) << "Configured custom UDALS ring weights: " << normalized[0] << ", "
+                      << normalized[1] << ", " << normalized[2];
+            return normalized;
+        }
+    }
+
+    LOG(WARNING) << "Invalid ro.vendor.sensors.notifier.udals.ring_weights='" << prop
+                 << "'; using default " << kDefaultRingWeights[0] << ", " << kDefaultRingWeights[1]
+                 << ", " << kDefaultRingWeights[2];
+    return kDefaultRingWeights;
+}
 
 std::array<float, 256> initGammaLut(float gamma) {
     std::array<float, 256> lut{};
@@ -236,6 +270,7 @@ CwbClient::CwbClient(UdalsGeometry geo, std::shared_ptr<UDalsBleedCompensator> c
       mRoiHeight(geo.bottom - geo.top),
       mCenterRelX(geo.cx - geo.left),
       mCenterRelY(geo.cy - geo.top),
+      mRingWeights(loadRingWeights()),
       mCompensator(std::move(compensator)) {
     mRadius1Sq = geo.r1 * geo.r1;
     mRadius2Sq = geo.r2 * geo.r2;
@@ -593,16 +628,16 @@ void CwbClient::stop() {
     mCv.notify_all();
 }
 
-void CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outRHigh, float* outGHigh,
-                                   float* outBHigh, float* outRLow, float* outGLow, float* outBLow,
-                                   float* outTotalWeight) const {
-    float weightedRHigh = 0.0f;
-    float weightedGHigh = 0.0f;
-    float weightedBHigh = 0.0f;
-    float weightedRLow = 0.0f;
-    float weightedGLow = 0.0f;
-    float weightedBLow = 0.0f;
-    float totalWeight = 0.0f;
+bool CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outNormRHigh, float* outNormGHigh,
+                                   float* outNormBHigh, float* outNormRLow, float* outNormGLow,
+                                   float* outNormBLow) const {
+    std::array<float, 3> sumRHigh{};
+    std::array<float, 3> sumGHigh{};
+    std::array<float, 3> sumBHigh{};
+    std::array<float, 3> sumRLow{};
+    std::array<float, 3> sumGLow{};
+    std::array<float, 3> sumBLow{};
+    std::array<uint32_t, 3> ringCounts{};
 
     for (int32_t y = 0; y < mRoiHeight; ++y) {
         int32_t dy = y - mCenterRelY;
@@ -617,37 +652,63 @@ void CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outRHigh, float
                 continue;
             }
 
-            float w;
+            size_t ring = 2;
             if (distSq <= mRadius1Sq) {
-                w = 1.0f;
+                ring = 0;
             } else if (distSq <= mRadius2Sq) {
-                w = 0.50f;
-            } else {
-                w = 0.20f;
+                ring = 1;
             }
 
-            int32_t offset = x * 4;
+            size_t offset = static_cast<size_t>(x) * 4;
             uint8_t r = row[offset];
             uint8_t g = row[offset + 1];
             uint8_t b = row[offset + 2];
 
-            weightedRHigh += kGammaLutHigh[r] * w;
-            weightedGHigh += kGammaLutHigh[g] * w;
-            weightedBHigh += kGammaLutHigh[b] * w;
-            weightedRLow += kGammaLutLow[r] * w;
-            weightedGLow += kGammaLutLow[g] * w;
-            weightedBLow += kGammaLutLow[b] * w;
-            totalWeight += w;
+            sumRHigh[ring] += kGammaLutHigh[r];
+            sumGHigh[ring] += kGammaLutHigh[g];
+            sumBHigh[ring] += kGammaLutHigh[b];
+            sumRLow[ring] += kGammaLutLow[r];
+            sumGLow[ring] += kGammaLutLow[g];
+            sumBLow[ring] += kGammaLutLow[b];
+            ringCounts[ring]++;
         }
     }
 
-    *outRHigh = weightedRHigh;
-    *outGHigh = weightedGHigh;
-    *outBHigh = weightedBHigh;
-    *outRLow = weightedRLow;
-    *outGLow = weightedGLow;
-    *outBLow = weightedBLow;
-    *outTotalWeight = totalWeight;
+    float activeWeightSum = 0.0f;
+    float combinedRHigh = 0.0f;
+    float combinedGHigh = 0.0f;
+    float combinedBHigh = 0.0f;
+    float combinedRLow = 0.0f;
+    float combinedGLow = 0.0f;
+    float combinedBLow = 0.0f;
+
+    for (size_t i = 0; i < 3; ++i) {
+        if (ringCounts[i] == 0 || mRingWeights[i] <= 0.0f) {
+            continue;
+        }
+        float invCount = 1.0f / static_cast<float>(ringCounts[i]);
+        float w = mRingWeights[i];
+        combinedRHigh += w * (sumRHigh[i] * invCount);
+        combinedGHigh += w * (sumGHigh[i] * invCount);
+        combinedBHigh += w * (sumBHigh[i] * invCount);
+        combinedRLow += w * (sumRLow[i] * invCount);
+        combinedGLow += w * (sumGLow[i] * invCount);
+        combinedBLow += w * (sumBLow[i] * invCount);
+        activeWeightSum += w;
+    }
+
+    if (activeWeightSum <= 0.0f) {
+        return false;
+    }
+
+    float invWeight = 1.0f / activeWeightSum;
+    *outNormRHigh = std::clamp(combinedRHigh * invWeight, 0.0f, 1.0f);
+    *outNormGHigh = std::clamp(combinedGHigh * invWeight, 0.0f, 1.0f);
+    *outNormBHigh = std::clamp(combinedBHigh * invWeight, 0.0f, 1.0f);
+    *outNormRLow = std::clamp(combinedRLow * invWeight, 0.0f, 1.0f);
+    *outNormGLow = std::clamp(combinedGLow * invWeight, 0.0f, 1.0f);
+    *outNormBLow = std::clamp(combinedBLow * invWeight, 0.0f, 1.0f);
+    return true;
 }
 
 CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
@@ -769,27 +830,17 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
         return CaptureResult::kFailed;
     }
 
-    float weightedRHigh = 0.0f;
-    float weightedGHigh = 0.0f;
-    float weightedBHigh = 0.0f;
-    float weightedRLow = 0.0f;
-    float weightedGLow = 0.0f;
-    float weightedBLow = 0.0f;
-    float totalWeight = 0.0f;
-    computeWeightedRgb(static_cast<const uint8_t*>(scopedLock.address()), &weightedRHigh,
-                       &weightedGHigh, &weightedBHigh, &weightedRLow, &weightedGLow, &weightedBLow,
-                       &totalWeight);
-
-    if (totalWeight <= 0.0f) {
+    float normRHigh = 0.0f;
+    float normGHigh = 0.0f;
+    float normBHigh = 0.0f;
+    float normRLow = 0.0f;
+    float normGLow = 0.0f;
+    float normBLow = 0.0f;
+    if (!computeWeightedRgb(static_cast<const uint8_t*>(scopedLock.address()), &normRHigh,
+                            &normGHigh, &normBHigh, &normRLow, &normGLow, &normBLow)) {
         return CaptureResult::kFailed;
     }
 
-    float normRHigh = std::clamp(weightedRHigh / totalWeight, 0.0f, 1.0f);
-    float normGHigh = std::clamp(weightedGHigh / totalWeight, 0.0f, 1.0f);
-    float normBHigh = std::clamp(weightedBHigh / totalWeight, 0.0f, 1.0f);
-    float normRLow = std::clamp(weightedRLow / totalWeight, 0.0f, 1.0f);
-    float normGLow = std::clamp(weightedGLow / totalWeight, 0.0f, 1.0f);
-    float normBLow = std::clamp(weightedBLow / totalWeight, 0.0f, 1.0f);
     mCompensator->setSampledRgb(normRHigh, normGHigh, normBHigh, normRLow, normGLow, normBLow);
 
     mConsecutiveErrors = 0;
@@ -979,7 +1030,7 @@ void CwbClient::captureWorkerThread() {
             mLastLockoutProbeTime = std::chrono::steady_clock::now();
             mRetryAfter = {};
         } else {
-            mRetryAfter = attemptStart + kMinDispatchInterval;
+            mRetryAfter = attemptStart + kRetryBackoffInterval;
         }
     }
 }
