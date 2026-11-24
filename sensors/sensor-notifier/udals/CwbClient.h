@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -50,9 +51,9 @@ class CwbClient {
     void releaseCwbWorker(bool freeBuffer);
     void triggerRefreshWorker();
     CaptureResult requestCwbSample(uint64_t currentGen);
-    void computeWeightedRgb(const uint8_t* pixels, float* outRHigh, float* outGHigh,
-                            float* outBHigh, float* outRLow, float* outGLow, float* outBLow,
-                            float* outTotalWeight) const;
+    bool computeWeightedRgb(const uint8_t* pixels, float* outNormRHigh, float* outNormGHigh,
+                            float* outNormBHigh, float* outNormRLow, float* outNormGLow,
+                            float* outNormBLow) const;
 
     UdalsGeometry mGeo;
     int32_t mRoiWidth;
@@ -62,6 +63,7 @@ class CwbClient {
     int32_t mRadius1Sq;
     int32_t mRadius2Sq;
     int32_t mRadius3Sq;
+    std::array<float, 3> mRingWeights;
 
     std::shared_ptr<UDalsBleedCompensator> mCompensator;
     std::atomic<bool> mInvalidRoi{false};
