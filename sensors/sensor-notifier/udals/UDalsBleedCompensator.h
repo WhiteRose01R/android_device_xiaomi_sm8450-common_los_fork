@@ -43,8 +43,10 @@ class UDalsBleedCompensator {
     void setDcMode(bool dcMode);
     void setSampledRgb(float r, float g, float b);
     void setSampledRgb(float rHigh, float gHigh, float bHigh, float rLow, float gLow, float bLow);
-    void updateTransitionHold(bool upwardPending, float rawLux, uint64_t expectedSeq);
+    void updateTransitionHold(int8_t pendingDir, float rawLux, float anchorRawLux,
+                              uint64_t expectedSeq);
     void clearTransitionHold();
+    bool isUnambiguousAmbient(float rawLux) const;
     bool compensate(float rawLux, float* outLux);
     bool hasSample() const;
     uint64_t getSampleSeq() const;
@@ -62,8 +64,11 @@ class UDalsBleedCompensator {
     float calculateBleedLuxForRgbLocked(uint32_t backlight, float r, float g, float b) const;
     float calculateBleedLuxLocked(uint32_t effectiveBacklight) const;
     float calculateMaxWhiteBleedLocked(uint32_t effectiveBacklight) const;
+    bool isTransitionBleedPlausibleLocked(int8_t dir, uint32_t effBkl, float rawLux,
+                                          float anchorRawLux) const;
     void resetResidualFilterLocked();
-    float filterSignedResidualLocked(float signedRes, float bleed);
+    float filterSignedResidualLocked(float signedRes, float bleed,
+                                     std::chrono::steady_clock::time_point now);
     static float interpolateTable(const std::vector<CaliPoint>& table, float brightness);
 
     mutable std::mutex mLock;
@@ -72,7 +77,7 @@ class UDalsBleedCompensator {
     bool mDcMode;
     bool mHasSample;
     bool mWakeGateActive;
-    bool mTransitionHoldActive;
+    int8_t mTransitionHoldDir;
     bool mTransitionHoldTimedOut;
     bool mHasSettledOutput;
     bool mHasResidualEma;
@@ -84,12 +89,14 @@ class UDalsBleedCompensator {
     float mNormLowG;
     float mNormLowB;
     float mLastSettledCompLux;
+    float mTransitionAnchorRawLux;
     float mResidualEma;
     float mPeakBleedLuxRed;
     float mPeakBleedLuxGreen;
     float mPeakBleedLuxBlue;
     std::chrono::steady_clock::time_point mResetTime{};
     std::chrono::steady_clock::time_point mTransitionHoldStart{};
+    std::chrono::steady_clock::time_point mLastResidualSampleTime{};
     std::deque<BacklightHoldEntry> mBacklightHistory;
     std::deque<float> mResidualWindow;
 

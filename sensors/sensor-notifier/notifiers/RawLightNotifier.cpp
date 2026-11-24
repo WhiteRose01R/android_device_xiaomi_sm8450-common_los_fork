@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 #include <cerrno>
 #include <cstring>
 #include <vector>
@@ -218,9 +219,17 @@ RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
     UdalsGeometry geo;
 
     static constexpr const char* kConfigPaths[] = {
-            "/vendor/etc/sensors/config/lightSensorConfig.json",
             "/odm/etc/sensors/config/lightSensorConfig.json",
+            "/vendor/etc/sensors/config/lightSensorConfig.json",
     };
+
+    int wakeFds[2] = {-1, -1};
+    if (pipe2(wakeFds, O_CLOEXEC | O_NONBLOCK) == 0) {
+        mWakeReadFd.reset(wakeFds[0]);
+        mWakeWriteFd.reset(wakeFds[1]);
+    } else {
+        PLOG(WARNING) << "Failed to create RawLightNotifier wake pipe";
+    }
 
     bool loaded = false;
     for (const char* path : kConfigPaths) {
@@ -247,6 +256,12 @@ RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager)
 
 RawLightNotifier::~RawLightNotifier() {
     mActive = false;
+    if (mWakeWriteFd.get() != -1) {
+        const uint8_t wakeByte = 1;
+        ssize_t ignored =
+                TEMP_FAILURE_RETRY(write(mWakeWriteFd.get(), &wakeByte, sizeof(wakeByte)));
+        (void)ignored;
+    }
     deactivate();
     if (mCwbClient != nullptr) {
         mCwbClient->stop();
@@ -343,15 +358,20 @@ void RawLightNotifier::notify() {
         }
     }
 
-    struct pollfd dispEventPoll = {
-            .fd = disp_fd_.get(),
-            .events = POLLIN,
-            .revents = 0,
-    };
+    std::vector<struct pollfd> pollfds;
+    pollfds.push_back({.fd = disp_fd_.get(), .events = POLLIN, .revents = 0});
+    int wakeIdx = -1;
+    if (mWakeReadFd.get() != -1) {
+        wakeIdx = static_cast<int>(pollfds.size());
+        pollfds.push_back({.fd = mWakeReadFd.get(), .events = POLLIN, .revents = 0});
+    }
+    int pollTimeoutMs = (wakeIdx >= 0) ? -1 : 500;
 
     while (mActive) {
-        dispEventPoll.revents = 0;
-        int rc = poll(&dispEventPoll, 1, 500);
+        for (auto& pfd : pollfds) {
+            pfd.revents = 0;
+        }
+        int rc = poll(pollfds.data(), pollfds.size(), pollTimeoutMs);
         if (rc == 0) {
             continue;
         }
@@ -361,7 +381,15 @@ void RawLightNotifier::notify() {
             }
             continue;
         }
-        if ((dispEventPoll.revents & POLLIN) == 0) {
+        if (wakeIdx >= 0 && (pollfds[static_cast<size_t>(wakeIdx)].revents & POLLIN)) {
+            uint8_t buf[16];
+            while (read(mWakeReadFd.get(), buf, sizeof(buf)) > 0) {
+            }
+            if (!mActive) {
+                break;
+            }
+        }
+        if ((pollfds[0].revents & POLLIN) == 0) {
             continue;
         }
 

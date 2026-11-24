@@ -33,14 +33,16 @@ constexpr float kMaxBleedRelevantLux = 15000.0f;
 constexpr float kMinTriggerDeltaLux = 1.5f;
 constexpr float kSustainedMinTriggerDeltaLux = 0.40f;
 constexpr uint32_t kSustainedLowLuxSamples = 2u;
+constexpr auto kSustainedMinDuration = std::chrono::milliseconds(80);
 constexpr float kMaxTriggerDeltaLux = 250.0f;
 constexpr float kTriggerRelativeDelta = 0.08f;
 constexpr auto kMinDispatchInterval = std::chrono::milliseconds(100);
 constexpr auto kRetryBackoffInterval = std::chrono::milliseconds(250);
-constexpr auto kInitialWaitTimeout = std::chrono::milliseconds(100);
+constexpr auto kInitialWaitTimeout = std::chrono::milliseconds(40);
 constexpr auto kPokeWaitTimeout = std::chrono::milliseconds(100);
 constexpr auto kDrainTimeout = std::chrono::milliseconds(150);
-constexpr auto kLockoutProbeInterval = std::chrono::seconds(2);
+constexpr auto kLockoutProbeBaseInterval = std::chrono::seconds(2);
+constexpr uint32_t kMaxLockoutProbeShift = 2u;
 constexpr uint32_t kLockoutThreshold = 3u;
 
 constexpr std::array<float, 3> kDefaultRingWeights = {0.68f, 0.20f, 0.12f};
@@ -83,9 +85,6 @@ std::array<float, 256> initGammaLut(float gamma) {
     }
     return lut;
 }
-
-const std::array<float, 256> kGammaLutHigh = initGammaLut(kGammaHigh);
-const std::array<float, 256> kGammaLutLow = initGammaLut(kGammaLow);
 
 struct ScopedHardwareBufferLock {
     ScopedHardwareBufferLock(AHardwareBuffer* buffer, uint64_t usage)
@@ -287,42 +286,59 @@ void CwbClient::onRawLuxSample(float rawLux) {
     }
 
     uint64_t seqBefore = (mCompensator != nullptr) ? mCompensator->getSampleSeq() : 0;
+    bool unambiguousAmbient =
+            (mCompensator != nullptr) && mCompensator->isUnambiguousAmbient(rawLux);
     bool shouldNotify = false;
-    bool upwardPending = false;
+    int8_t pendingDir = 0;
+    float anchorRawLux = rawLux;
     {
         std::lock_guard<std::mutex> lock(mControlMutex);
         if (!mRunning || mPaused) {
             return;
         }
+        auto now = std::chrono::steady_clock::now();
         if (rawLux >= kMaxBleedRelevantLux) {
             bool changed = !mAboveBleedRelevantLux;
             mAboveBleedRelevantLux = true;
             mHasLatestRawLux = false;
+            mLatestRawLuxTime = {};
             mHasRawLuxAnchor = false;
             mSeedAnchorOnNextSample = false;
             mSustainedDeltaCount = 0;
             mSustainedDeltaSign = 0;
-            mUpwardCapturePending = false;
+            mSustainedStartTime = {};
+            mPendingTransitionDir = 0;
             mCaptureRequested = false;
             shouldNotify = changed;
         } else {
             bool resumedFromHighLux = mAboveBleedRelevantLux;
             mAboveBleedRelevantLux = false;
             mLatestRawLux = rawLux;
+            mLatestRawLuxTime = now;
             mHasLatestRawLux = true;
             if (mInLockout) {
                 mSustainedDeltaCount = 0;
                 mSustainedDeltaSign = 0;
-                mUpwardCapturePending = false;
-                shouldNotify = resumedFromHighLux;
+                mSustainedStartTime = {};
+                mPendingTransitionDir = 0;
+                if (resumedFromHighLux || unambiguousAmbient) {
+                    if (mLockoutProbeShift > 0) {
+                        mLockoutProbeShift = 0;
+                        shouldNotify = true;
+                    } else if (resumedFromHighLux) {
+                        shouldNotify = true;
+                    }
+                }
             } else if (mSeedAnchorOnNextSample) {
                 mLastTriggerRawLux = rawLux;
                 mHasRawLuxAnchor = true;
                 mSeedAnchorOnNextSample = false;
                 mSustainedDeltaCount = 0;
                 mSustainedDeltaSign = 0;
-                mUpwardCapturePending = false;
+                mSustainedStartTime = {};
+                mPendingTransitionDir = 0;
             } else {
+                anchorRawLux = mLastTriggerRawLux;
                 float delta = rawLux - mLastTriggerRawLux;
                 float absDelta = std::fabs(delta);
                 float immediateThreshold = std::clamp(kTriggerRelativeDelta * mLastTriggerRawLux,
@@ -334,33 +350,40 @@ void CwbClient::onRawLuxSample(float rawLux) {
                 if (!mHasRawLuxAnchor) {
                     mSustainedDeltaCount = 0;
                     mSustainedDeltaSign = 0;
-                    mUpwardCapturePending = false;
+                    mSustainedStartTime = {};
+                    mPendingTransitionDir = 0;
                     shouldTrigger = true;
                 } else if (absDelta >= immediateThreshold) {
                     mSustainedDeltaCount = 0;
                     mSustainedDeltaSign = 0;
-                    mUpwardCapturePending = (delta > 0.0f);
+                    mSustainedStartTime = {};
+                    mPendingTransitionDir = (delta > 0.0f) ? 1 : -1;
                     shouldTrigger = true;
                 } else if (absDelta >= sustainedThreshold) {
                     int8_t sign = (delta > 0.0f) ? 1 : -1;
-                    if (sign == mSustainedDeltaSign) {
+                    if (sign == mSustainedDeltaSign && mSustainedDeltaCount > 0) {
                         mSustainedDeltaCount++;
                     } else {
                         mSustainedDeltaSign = sign;
                         mSustainedDeltaCount = 1;
+                        mSustainedStartTime = now;
                     }
-                    if (sign < 0) {
-                        mUpwardCapturePending = false;
+                    if (mPendingTransitionDir != 0 && mPendingTransitionDir != sign) {
+                        mPendingTransitionDir = 0;
                     }
-                    if (mSustainedDeltaCount >= kSustainedLowLuxSamples) {
+                    if (mSustainedDeltaCount >= kSustainedLowLuxSamples &&
+                        (now - mSustainedStartTime) >= kSustainedMinDuration) {
                         mSustainedDeltaCount = 0;
                         mSustainedDeltaSign = 0;
-                        mUpwardCapturePending = (sign > 0);
+                        mSustainedStartTime = {};
+                        mPendingTransitionDir = sign;
                         shouldTrigger = true;
                     }
                 } else {
                     mSustainedDeltaCount = 0;
                     mSustainedDeltaSign = 0;
+                    mSustainedStartTime = {};
+                    mPendingTransitionDir = 0;
                 }
 
                 if (shouldTrigger && !mCaptureRequested) {
@@ -368,14 +391,18 @@ void CwbClient::onRawLuxSample(float rawLux) {
                     shouldNotify = true;
                 }
 
-                upwardPending = hasActiveBacklight() &&
-                                (mUpwardCapturePending ||
-                                 (mSustainedDeltaCount > 0 && mSustainedDeltaSign > 0));
+                if (hasActiveBacklight()) {
+                    if (mPendingTransitionDir != 0) {
+                        pendingDir = mPendingTransitionDir;
+                    } else if (mSustainedDeltaCount > 0) {
+                        pendingDir = mSustainedDeltaSign;
+                    }
+                }
             }
         }
     }
     if (mCompensator != nullptr) {
-        mCompensator->updateTransitionHold(upwardPending, rawLux, seqBefore);
+        mCompensator->updateTransitionHold(pendingDir, rawLux, anchorRawLux, seqBefore);
     }
     if (shouldNotify) {
         mCv.notify_one();
@@ -548,15 +575,18 @@ bool CwbClient::start() {
         gen = ++mCaptureGen;
         mPaused = false;
         mInLockout = false;
+        mLockoutProbeShift = 0;
         mAboveBleedRelevantLux = false;
         mHasLatestRawLux = false;
         mLatestRawLux = 0.0f;
+        mLatestRawLuxTime = {};
         mHasRawLuxAnchor = false;
         mLastTriggerRawLux = 0.0f;
         mSeedAnchorOnNextSample = false;
         mSustainedDeltaCount = 0;
         mSustainedDeltaSign = 0;
-        mUpwardCapturePending = false;
+        mSustainedStartTime = {};
+        mPendingTransitionDir = 0;
         mCaptureRequested = true;
         cb = mActiveCallback;
         if (!mRunning) {
@@ -582,15 +612,18 @@ void CwbClient::stop() {
         mPaused = true;
         mCaptureRequested = false;
         mInLockout = false;
+        mLockoutProbeShift = 0;
         mAboveBleedRelevantLux = false;
         mHasLatestRawLux = false;
         mLatestRawLux = 0.0f;
+        mLatestRawLuxTime = {};
         mHasRawLuxAnchor = false;
         mLastTriggerRawLux = 0.0f;
         mSeedAnchorOnNextSample = false;
         mSustainedDeltaCount = 0;
         mSustainedDeltaSign = 0;
-        mUpwardCapturePending = false;
+        mSustainedStartTime = {};
+        mPendingTransitionDir = 0;
         gen = ++mCaptureGen;
         cb = mActiveCallback;
     }
@@ -607,6 +640,9 @@ void CwbClient::stop() {
 bool CwbClient::computeWeightedRgb(const uint8_t* pixels, float* outNormRHigh, float* outNormGHigh,
                                    float* outNormBHigh, float* outNormRLow, float* outNormGLow,
                                    float* outNormBLow) const {
+    static const std::array<float, 256> kGammaLutHigh = initGammaLut(kGammaHigh);
+    static const std::array<float, 256> kGammaLutLow = initGammaLut(kGammaLow);
+
     std::array<float, 3> sumRHigh{};
     std::array<float, 3> sumGHigh{};
     std::array<float, 3> sumBHigh{};
@@ -793,20 +829,21 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
         return CaptureResult::kFailed;
     }
 
-    ScopedHardwareBufferLock scopedLock(mCwbBuffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN);
-    if (!scopedLock.isLocked()) {
-        return CaptureResult::kFailed;
-    }
-
     float normRHigh = 0.0f;
     float normGHigh = 0.0f;
     float normBHigh = 0.0f;
     float normRLow = 0.0f;
     float normGLow = 0.0f;
     float normBLow = 0.0f;
-    if (!computeWeightedRgb(static_cast<const uint8_t*>(scopedLock.address()), &normRHigh,
-                            &normGHigh, &normBHigh, &normRLow, &normGLow, &normBLow)) {
-        return CaptureResult::kFailed;
+    {
+        ScopedHardwareBufferLock scopedLock(mCwbBuffer, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN);
+        if (!scopedLock.isLocked()) {
+            return CaptureResult::kFailed;
+        }
+        if (!computeWeightedRgb(static_cast<const uint8_t*>(scopedLock.address()), &normRHigh,
+                                &normGHigh, &normBHigh, &normRLow, &normGLow, &normBLow)) {
+            return CaptureResult::kFailed;
+        }
     }
 
     mCompensator->setSampledRgb(normRHigh, normGHigh, normBHigh, normRLow, normGLow, normBLow);
@@ -826,6 +863,7 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
             return CaptureResult::kAborted;
         }
         mInLockout = false;
+        mLockoutProbeShift = 0;
         if (hadDispatchLux) {
             if (mHasLatestRawLux) {
                 mLastTriggerRawLux = dispatchRawLux;
@@ -840,19 +878,22 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
                                    kSustainedMinTriggerDeltaLux, kMaxTriggerDeltaLux);
                 if (absDelta >= immediateThreshold) {
                     mCaptureRequested = true;
-                    mUpwardCapturePending = (delta > 0.0f);
+                    mPendingTransitionDir = (delta > 0.0f) ? 1 : -1;
                     mSustainedDeltaCount = 0;
                     mSustainedDeltaSign = 0;
+                    mSustainedStartTime = {};
                 } else if (absDelta >= sustainedThreshold) {
                     mCaptureRequested = false;
-                    mUpwardCapturePending = false;
+                    mPendingTransitionDir = 0;
                     mSustainedDeltaSign = (delta > 0.0f) ? 1 : -1;
                     mSustainedDeltaCount = 1;
+                    mSustainedStartTime = mLatestRawLuxTime;
                 } else {
                     mCaptureRequested = false;
-                    mUpwardCapturePending = false;
+                    mPendingTransitionDir = 0;
                     mSustainedDeltaCount = 0;
                     mSustainedDeltaSign = 0;
+                    mSustainedStartTime = {};
                 }
             } else {
                 // Ambient lux crossed >= kMaxBleedRelevantLux mid-capture.
@@ -860,7 +901,8 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
                 mSeedAnchorOnNextSample = false;
                 mSustainedDeltaCount = 0;
                 mSustainedDeltaSign = 0;
-                mUpwardCapturePending = false;
+                mSustainedStartTime = {};
+                mPendingTransitionDir = 0;
                 mCaptureRequested = false;
             }
         } else if (mHasLatestRawLux) {
@@ -869,14 +911,16 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
             mSeedAnchorOnNextSample = false;
             mSustainedDeltaCount = 0;
             mSustainedDeltaSign = 0;
-            mUpwardCapturePending = false;
+            mSustainedStartTime = {};
+            mPendingTransitionDir = 0;
             mCaptureRequested = false;
         } else {
             mHasRawLuxAnchor = false;
             mSeedAnchorOnNextSample = true;
             mSustainedDeltaCount = 0;
             mSustainedDeltaSign = 0;
-            mUpwardCapturePending = false;
+            mSustainedStartTime = {};
+            mPendingTransitionDir = 0;
             mCaptureRequested = false;
         }
     }
@@ -890,6 +934,7 @@ void CwbClient::captureWorkerThread() {
     while (true) {
         uint64_t currentGen = 0;
         bool inLockout = false;
+        uint32_t lockoutShift = 0;
         {
             std::unique_lock<std::mutex> lock(mControlMutex);
             mCv.wait(lock, [this] {
@@ -901,6 +946,7 @@ void CwbClient::captureWorkerThread() {
             }
             currentGen = mCaptureGen;
             inLockout = mInLockout;
+            lockoutShift = mLockoutProbeShift;
         }
 
         if (currentGen != mLastSeenGen) {
@@ -917,9 +963,11 @@ void CwbClient::captureWorkerThread() {
         std::chrono::steady_clock::duration waitDuration{};
         if (inLockout) {
             if (mLastLockoutProbeTime.time_since_epoch().count() != 0) {
+                auto probeInterval = kLockoutProbeBaseInterval *
+                                     (1u << std::min(lockoutShift, kMaxLockoutProbeShift));
                 auto elapsed = now - mLastLockoutProbeTime;
-                if (elapsed < kLockoutProbeInterval) {
-                    waitDuration = kLockoutProbeInterval - elapsed;
+                if (elapsed < probeInterval) {
+                    waitDuration = probeInterval - elapsed;
                 }
             }
         } else {
@@ -938,12 +986,14 @@ void CwbClient::captureWorkerThread() {
         if (waitDuration > std::chrono::steady_clock::duration::zero()) {
             std::unique_lock<std::mutex> lock(mControlMutex);
             if (mRunning && !mPaused && mCaptureGen == currentGen && mInLockout == inLockout &&
-                !mAboveBleedRelevantLux && (inLockout || mCaptureRequested) &&
-                hasActiveBacklight()) {
+                (!inLockout || mLockoutProbeShift == lockoutShift) && !mAboveBleedRelevantLux &&
+                (inLockout || mCaptureRequested) && hasActiveBacklight()) {
                 mCv.wait_for(lock, waitDuration, [&] {
                     return !mRunning || mPaused || mCaptureGen != currentGen ||
-                           mInLockout != inLockout || mAboveBleedRelevantLux ||
-                           (!inLockout && !mCaptureRequested) || !hasActiveBacklight();
+                           mInLockout != inLockout ||
+                           (inLockout && mLockoutProbeShift != lockoutShift) ||
+                           mAboveBleedRelevantLux || (!inLockout && !mCaptureRequested) ||
+                           !hasActiveBacklight();
                 });
             }
             if (!mRunning) {
@@ -978,8 +1028,11 @@ void CwbClient::captureWorkerThread() {
                     if (!mInLockout) {
                         clearNow = true;
                         mInLockout = true;
+                        mLockoutProbeShift = 0;
+                    } else if (inLockout && mLockoutProbeShift < kMaxLockoutProbeShift) {
+                        ++mLockoutProbeShift;
                     }
-                    mUpwardCapturePending = false;
+                    mPendingTransitionDir = 0;
                     mCaptureRequested = false;
                 } else if (!mInLockout) {
                     mCaptureRequested = true;
