@@ -337,6 +337,7 @@ void CwbClient::onRawLuxSample(float rawLux) {
         if (rawLux >= kMaxBleedRelevantLux) {
             bool changed = !mAboveBleedRelevantLux;
             mAboveBleedRelevantLux = true;
+            mWasUnambiguousAmbientInLockout = false;
             mHasLatestRawLux = false;
             mLatestRawLuxTime = {};
             mHasRawLuxAnchor = false;
@@ -358,7 +359,9 @@ void CwbClient::onRawLuxSample(float rawLux) {
                 mSustainedDeltaSign = 0;
                 mSustainedStartTime = {};
                 mPendingTransitionDir = 0;
-                if (resumedFromHighLux || unambiguousAmbient) {
+                bool ambientRisingEdge = unambiguousAmbient && !mWasUnambiguousAmbientInLockout;
+                mWasUnambiguousAmbientInLockout = unambiguousAmbient;
+                if (resumedFromHighLux || ambientRisingEdge) {
                     if (mLockoutProbeShift > 0) {
                         mLockoutProbeShift = 0;
                         shouldNotify = true;
@@ -602,6 +605,7 @@ bool CwbClient::start() {
         gen = ++mCaptureGen;
         mPaused = false;
         mInLockout = false;
+        mWasUnambiguousAmbientInLockout = false;
         mLockoutProbeShift = 0;
         mAboveBleedRelevantLux = false;
         mHasLatestRawLux = false;
@@ -639,6 +643,7 @@ void CwbClient::stop() {
         mPaused = true;
         mCaptureRequested = false;
         mInLockout = false;
+        mWasUnambiguousAmbientInLockout = false;
         mLockoutProbeShift = 0;
         mAboveBleedRelevantLux = false;
         mHasLatestRawLux = false;
@@ -898,6 +903,7 @@ CwbClient::CaptureResult CwbClient::requestCwbSample(uint64_t currentGen) {
             return CaptureResult::kAborted;
         }
         mInLockout = false;
+        mWasUnambiguousAmbientInLockout = false;
         mLockoutProbeShift = 0;
         if (hadDispatchLux) {
             if (mHasLatestRawLux) {
@@ -1063,6 +1069,7 @@ void CwbClient::captureWorkerThread() {
                     if (!mInLockout) {
                         clearNow = true;
                         mInLockout = true;
+                        mWasUnambiguousAmbientInLockout = false;
                         mLockoutProbeShift = 0;
                     } else if (inLockout && mLockoutProbeShift < kMaxLockoutProbeShift) {
                         ++mLockoutProbeShift;

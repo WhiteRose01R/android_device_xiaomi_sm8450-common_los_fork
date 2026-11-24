@@ -40,14 +40,12 @@ class UDalsBleedCompensator {
     void reset();
     void clearSample();
     void setBacklight(uint32_t brightness);
-    void setSampledRgb(float r, float g, float b);
     void setSampledRgb(float rHigh, float gHigh, float bHigh, float rLow, float gLow, float bLow);
     void updateTransitionHold(int8_t pendingDir, float rawLux, float anchorRawLux,
                               uint64_t expectedSeq);
     void clearTransitionHold();
     bool isUnambiguousAmbient(float rawLux) const;
     bool compensate(float rawLux, float* outLux);
-    bool hasSample() const;
     uint64_t getSampleSeq() const;
     uint32_t getBacklight() const;
     uint32_t getNormalMaxBacklight() const;

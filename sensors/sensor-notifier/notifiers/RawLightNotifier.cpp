@@ -82,7 +82,6 @@ class RawLightSensorCallback : public IEventQueueCallback {
     float mMsgUnknown1;
 };
 
-// Check panel0 first (primary display); fallback to panel1 only if panel0 sysfs node is absent.
 static bool readPanelSysfsUint(const char* attr, uint32_t* out) {
     static std::atomic<bool> loggedReadError{false};
     for (const char* panel : {"panel0-backlight", "panel1-backlight"}) {
