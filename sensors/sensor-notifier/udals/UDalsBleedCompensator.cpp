@@ -293,11 +293,6 @@ void UDalsBleedCompensator::setBacklight(uint32_t brightness) {
     mBacklight = brightness;
 }
 
-bool UDalsBleedCompensator::hasSample() const {
-    std::lock_guard<std::mutex> lock(mLock);
-    return mHasSample;
-}
-
 uint64_t UDalsBleedCompensator::getSampleSeq() const {
     std::lock_guard<std::mutex> lock(mLock);
     return mSampleSeq;
@@ -316,10 +311,6 @@ uint32_t UDalsBleedCompensator::getNormalMaxBacklight() const {
 void UDalsBleedCompensator::setDcMode(bool dcMode) {
     std::lock_guard<std::mutex> lock(mLock);
     mDcMode = dcMode;
-}
-
-void UDalsBleedCompensator::setSampledRgb(float r, float g, float b) {
-    setSampledRgb(r, g, b, r, g, b);
 }
 
 void UDalsBleedCompensator::setSampledRgb(float rHigh, float gHigh, float bHigh, float rLow,
@@ -385,7 +376,6 @@ void UDalsBleedCompensator::updateTransitionHold(int8_t pendingDir, float rawLux
     float effAnchor =
             (mTransitionHoldDir == normalizedDir) ? mTransitionAnchorRawLux : anchorRawLux;
     if (!isTransitionBleedPlausibleLocked(normalizedDir, effBkl, rawLux, effAnchor)) {
-        // Unambiguous room-light step: release hold immediately.
         mTransitionHoldDir = 0;
         mTransitionHoldTimedOut = false;
         mTransitionAnchorRawLux = 0.0f;
@@ -506,9 +496,7 @@ float UDalsBleedCompensator::calculateBleedLuxLocked(uint32_t effectiveBacklight
         return 0.0f;
     }
 
-    // Blend per-pixel high-BKL (gamma 2.0) and low-BKL (gamma 1.6) linear bases via a 1.5-order
-    // Hill knee to model AMOLED low-DBV shadow lift with fast high-BKL decay while staying exact
-    // on pure black, white, and B/W icons.
+    // Blend high-BKL (gamma 2.0) and low-BKL (gamma 1.6) linear bases to model low-DBV shadow lift.
     float knee = (mNormalMaxBacklight > 0)
                          ? std::max(1.0f,
                                     kLowGammaKneeFraction * static_cast<float>(mNormalMaxBacklight))
@@ -549,8 +537,7 @@ float UDalsBleedCompensator::filterSignedResidualLocked(float signedRes, float b
         return std::max(0.0f, signedRes);
     }
 
-    // Pass bright ambient light (>= 5 lux) straight through without lag while preserving the
-    // 5-sample window so downward pre-CWB dips cannot poison Median-5/EMA.
+    // Pass bright ambient (>= 5 lux) through directly while keeping the median window current.
     if (mHasResidualEma && mResidualEma >= kLowLuxFilterCeiling &&
         signedRes >= kLowLuxFilterCeiling) {
         if (signedRes < mResidualEma - kEmaStepBypassDelta) {
@@ -567,8 +554,7 @@ float UDalsBleedCompensator::filterSignedResidualLocked(float signedRes, float b
         return std::max(0.0f, signedRes);
     }
 
-    // Filter unrectified (raw - bleed) before clamping at 0 so symmetric OLED PWM beat swings
-    // cancel instead of half-wave rectifying into a positive lux offset.
+    // Filter signed (raw - bleed) before clamping at 0 so symmetric PWM ripple cancels out.
     mResidualWindow.push_back(signedRes);
     while (mResidualWindow.size() > kResidualMedianWindow) {
         mResidualWindow.pop_front();
@@ -582,8 +568,7 @@ float UDalsBleedCompensator::filterSignedResidualLocked(float signedRes, float b
     std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(n));
     float med = sorted[(n - 1) / 2];
 
-    // Evaluate EMA step-bypass strictly on the Median-5 output so 1-2 sample spikes > 1.5 lux
-    // remain blocked while genuine ambient steps snap cleanly once they pass Median-5.
+    // Check EMA step-bypass on the median output so brief spikes stay rejected.
     if (!mHasResidualEma || std::fabs(med - mResidualEma) > kEmaStepBypassDelta ||
         med >= kLowLuxEmaCeiling || mLastResidualSampleTime.time_since_epoch().count() == 0) {
         mResidualEma = med;
@@ -607,7 +592,7 @@ bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
     std::lock_guard<std::mutex> lock(mLock);
     auto now = std::chrono::steady_clock::now();
 
-    // Suppress flare spikes during display wake prior to first CWB frame capture or timeout
+    // Drop ALS events on wake until the first CWB capture completes or times out.
     if (mWakeGateActive) {
         if ((now - mResetTime) < kWakeGateTimeout) {
             return false;
@@ -617,8 +602,7 @@ bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
 
     uint32_t effBkl = effectiveBacklightLocked(now);
 
-    // Hold last settled compensated lux while a bleed-plausible upward or downward CWB capture is
-    // pending so Xiaomi's SSC receives a steady stream without pre-CWB spikes or 0-lux plunges.
+    // Hold the last settled lux while a bleed-plausible CWB capture is pending.
     if (mTransitionHoldDir != 0) {
         auto elapsed = now - mTransitionHoldStart;
         if (mHasSample && effBkl > 0 && mHasSettledOutput &&

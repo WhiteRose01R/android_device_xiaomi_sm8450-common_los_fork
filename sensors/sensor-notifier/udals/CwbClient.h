@@ -75,6 +75,7 @@ class CwbClient {
     uint64_t mCaptureGen = 0;
     bool mCaptureRequested = false;
     bool mInLockout = false;
+    bool mWasUnambiguousAmbientInLockout = false;
     bool mAboveBleedRelevantLux = false;
     bool mHasLatestRawLux = false;
     float mLatestRawLux = 0.0f;
