@@ -509,14 +509,17 @@ float UDalsBleedCompensator::filterSignedResidualLocked(float signedRes, float b
         return std::max(0.0f, signedRes);
     }
 
+    // Clamp stale bright-room entries whenever ambient drops sharply out of the bright regime.
+    if (mHasResidualEma && mResidualEma >= kLowLuxFilterCeiling &&
+        signedRes < mResidualEma - kEmaStepBypassDelta) {
+        for (float& val : mResidualWindow) {
+            val = std::min(val, signedRes);
+        }
+    }
+
     // Pass bright ambient (>= 5 lux) through directly while keeping the median window current.
     if (mHasResidualEma && mResidualEma >= kLowLuxFilterCeiling &&
         signedRes >= kLowLuxFilterCeiling) {
-        if (signedRes < mResidualEma - kEmaStepBypassDelta) {
-            for (float& val : mResidualWindow) {
-                val = std::min(val, signedRes);
-            }
-        }
         mResidualWindow.push_back(signedRes);
         while (mResidualWindow.size() > kResidualMedianWindow) {
             mResidualWindow.pop_front();
@@ -592,7 +595,7 @@ bool UDalsBleedCompensator::compensate(float rawLux, float* outLux) {
     }
 
     float bleed = calculateBleedLuxLocked(effBkl);
-    float filtered = filterSignedResidualLocked(rawLux - bleed, bleed, now);
+    float filtered = std::min(filterSignedResidualLocked(rawLux - bleed, bleed, now), rawLux);
     mLastSettledCompLux = filtered;
     mHasSettledOutput = true;
     *outLux = filtered;
