@@ -27,6 +27,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "SensorNotifierUtils.h"
@@ -48,12 +49,29 @@ constexpr auto kMaxEnableRetryInterval = std::chrono::milliseconds(10000);
 
 class RawLightSensorCallback : public IEventQueueCallback {
   public:
-    explicit RawLightSensorCallback(float msgUnknown1) : mMsgUnknown1(msgUnknown1) {}
+    RawLightSensorCallback(std::shared_ptr<UDalsBleedCompensator> compensator,
+                           std::weak_ptr<CwbClient> cwbClient, float msgUnknown1)
+        : mCompensator(std::move(compensator)),
+          mCwbClient(std::move(cwbClient)),
+          mMsgUnknown1(msgUnknown1) {}
 
     Return<void> onEvent(const Event& e) override {
+        float rawLux = e.u.vec4.y;
+        float compensatedLux = rawLux;
+
+        if (auto cwb = mCwbClient.lock()) {
+            cwb->onRawLuxSample(rawLux);
+        }
+
+        if (mCompensator != nullptr) {
+            if (!mCompensator->compensate(rawLux, &compensatedLux)) {
+                return Void();
+            }
+        }
+
         _oem_msg msg{};
         msg.notifyType = REPORT_VALUE;
-        msg.value = e.u.vec4.y;
+        msg.value = compensatedLux;
         msg.notifyTypeFloat = static_cast<float>(msg.notifyType);
         msg.unknown1 = mMsgUnknown1;
         msg.unknown2 = 5.0f;
@@ -61,10 +79,15 @@ class RawLightSensorCallback : public IEventQueueCallback {
 
         SscCalApiWrapper::getInstance().processMsg(&msg);
 
+        LOG(VERBOSE) << "UDALS event: raw=" << rawLux << " compensated=" << compensatedLux
+                     << " bleed=" << (rawLux - compensatedLux);
+
         return Void();
     }
 
   private:
+    std::shared_ptr<UDalsBleedCompensator> mCompensator;
+    std::weak_ptr<CwbClient> mCwbClient;
     float mMsgUnknown1;
 };
 
@@ -101,6 +124,19 @@ std::optional<uint32_t> readCurrentBrightness(int dispFd) {
     return std::nullopt;
 }
 
+void syncDisplayFeatures(int dispFd, const std::shared_ptr<UDalsBleedCompensator>& compensator) {
+    if (dispFd < 0 || compensator == nullptr) {
+        return;
+    }
+
+    disp_feature_req req{};
+    req.base.disp_id = MI_DISP_PRIMARY;
+    req.feature_id = DISP_FEATURE_DC;
+    if (ioctl(dispFd, MI_DISP_IOCTL_GET_FEATURE, &req) == 0) {
+        compensator->setDcMode(req.feature_val != FEATURE_OFF);
+    }
+}
+
 template <typename T>
 bool readDispPayload(const disp_event_resp& response, size_t payloadLength, T* out) {
     if (payloadLength < sizeof(T)) {
@@ -111,6 +147,50 @@ bool readDispPayload(const disp_event_resp& response, size_t payloadLength, T* o
 }
 
 }  // namespace
+
+void RawLightNotifier::resolveBacklightScale() {
+    if (mDeviceNormalMaxBacklight) {
+        return;
+    }
+
+    uint32_t propMax = android::base::GetUintProperty<uint32_t>(
+            "ro.vendor.sensors.notifier.udals.normal_max_brightness", 0u);
+    if (propMax > 0) {
+        mDeviceNormalMaxBacklight = propMax;
+        return;
+    }
+
+    uint32_t sysfsMax = 0;
+    if (readPanelSysfsUint("max_brightness", &sysfsMax) && sysfsMax > 0) {
+        uint64_t tableMax =
+                (mCompensator != nullptr) ? mCompensator->getNormalMaxBacklight() : 2047u;
+        mDeviceNormalMaxBacklight =
+                (sysfsMax > tableMax + tableMax / 2) ? (sysfsMax / 2) : sysfsMax;
+    }
+}
+
+uint32_t RawLightNotifier::normalizeBacklight(uint32_t raw) const {
+    uint32_t targetMax = (mCompensator != nullptr) ? mCompensator->getNormalMaxBacklight() : 2047u;
+    if (!mDeviceNormalMaxBacklight || *mDeviceNormalMaxBacklight == 0 ||
+        *mDeviceNormalMaxBacklight == targetMax) {
+        return raw;
+    }
+    uint32_t deviceMax = *mDeviceNormalMaxBacklight;
+    return static_cast<uint32_t>((static_cast<uint64_t>(raw) * targetMax + (deviceMax / 2)) /
+                                 deviceMax);
+}
+
+void RawLightNotifier::updateBacklight(uint32_t rawBacklight) {
+    if (mCompensator == nullptr) {
+        return;
+    }
+    uint32_t normalized = normalizeBacklight(rawBacklight);
+    uint32_t prevNormalized = mCompensator->getBacklight();
+    mCompensator->setBacklight(normalized);
+    if (prevNormalized == 0 && normalized > 0 && mCwbClient != nullptr) {
+        mCwbClient->notifyBacklightChanged();
+    }
+}
 
 bool RawLightNotifier::setSensorEnabled(bool enable) {
     if (enable == mEnabled) {
@@ -127,7 +207,27 @@ bool RawLightNotifier::setSensorEnabled(bool enable) {
     return true;
 }
 
+void RawLightNotifier::syncCompensatorDisplayState(int dispFd,
+                                                   std::optional<uint32_t> initialRawBkl) {
+    if (mCompensator == nullptr) {
+        return;
+    }
+    resolveBacklightScale();
+    if (auto bkl = initialRawBkl ? initialRawBkl : readCurrentBrightness(dispFd)) {
+        updateBacklight(*bkl);
+    }
+    syncDisplayFeatures(dispFd, mCompensator);
+}
+
 RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager) : SensorNotifier(manager) {
+    auto compensator = std::make_shared<UDalsBleedCompensator>();
+    UdalsGeometry geo;
+
+    static constexpr const char* kConfigPaths[] = {
+            "/odm/etc/sensors/config/lightSensorConfig.json",
+            "/vendor/etc/sensors/config/lightSensorConfig.json",
+    };
+
     int wakeFds[2] = {-1, -1};
     if (pipe2(wakeFds, O_CLOEXEC | O_NONBLOCK) == 0) {
         mWakeReadFd.reset(wakeFds[0]);
@@ -136,10 +236,26 @@ RawLightNotifier::RawLightNotifier(sp<ISensorManager> manager) : SensorNotifier(
         PLOG(WARNING) << "Failed to create RawLightNotifier wake pipe";
     }
 
+    bool loaded = false;
+    for (const char* path : kConfigPaths) {
+        if (compensator->loadConfig(path, &geo)) {
+            loaded = true;
+            break;
+        }
+    }
+
+    if (loaded) {
+        mCompensator = compensator;
+        resolveBacklightScale();
+        mCwbClient = std::make_shared<CwbClient>(geo, mCompensator);
+    } else {
+        LOG(INFO) << "No UDALS CWB configuration available; running uncompensated";
+    }
+
     float msgUnknown1 = static_cast<float>(android::base::GetUintProperty<uint32_t>(
             "ro.vendor.sensors.notifier.raw_light.unknown1", 2u));
     initializeSensorQueue("xiaomi.sensor.ambientlight.factory", false,
-                          new RawLightSensorCallback(msgUnknown1));
+                          new RawLightSensorCallback(mCompensator, mCwbClient, msgUnknown1));
 }
 
 RawLightNotifier::~RawLightNotifier() {
@@ -151,6 +267,9 @@ RawLightNotifier::~RawLightNotifier() {
         (void)ignored;
     }
     deactivate();
+    if (mCwbClient != nullptr) {
+        mCwbClient->stop();
+    }
     mEnabled = false;
 }
 
@@ -169,6 +288,9 @@ void RawLightNotifier::notify() {
     }
 
     std::vector<disp_event_type> notifyEvents = {MI_DISP_EVENT_POWER, MI_DISP_EVENT_51_BRIGHTNESS};
+    if (mCompensator != nullptr) {
+        notifyEvents.push_back(MI_DISP_EVENT_DC);
+    }
 
     for (const disp_event_type& event : notifyEvents) {
         disp_event_req req{};
@@ -186,10 +308,14 @@ void RawLightNotifier::notify() {
     std::optional<std::chrono::steady_clock::time_point> nextEnableRetry;
     auto enableRetryDelay = kInitialEnableRetryInterval;
 
-    auto enterDisplayOn = [&]() {
+    auto enterDisplayOn = [&](std::optional<uint32_t> initialRawBkl = std::nullopt) {
         wantDisplayOn = true;
         if (displayOn) {
             return;
+        }
+        if (mCompensator != nullptr) {
+            mCompensator->reset();
+            syncCompensatorDisplayState(disp_fd_.get(), initialRawBkl);
         }
         if (!setSensorEnabled(true)) {
             nextEnableRetry = std::chrono::steady_clock::now() + enableRetryDelay;
@@ -199,6 +325,9 @@ void RawLightNotifier::notify() {
         nextEnableRetry.reset();
         enableRetryDelay = kInitialEnableRetryInterval;
         displayOn = true;
+        if (mActive && mCwbClient != nullptr) {
+            mCwbClient->start();
+        }
     };
 
     auto enterDisplayOff = [&](bool disableSensor) {
@@ -212,6 +341,12 @@ void RawLightNotifier::notify() {
         if (disableSensor) {
             setSensorEnabled(false);
         }
+        if (mCwbClient != nullptr) {
+            mCwbClient->stop();
+        }
+        if (mCompensator != nullptr) {
+            mCompensator->reset();
+        }
     };
 
     disp_doze_brightness_req dozeReq{};
@@ -222,7 +357,7 @@ void RawLightNotifier::notify() {
         powerEventSeen = true;
     } else if (auto startupBl = readCurrentBrightness(disp_fd_.get());
                startupBl && *startupBl > 0) {
-        enterDisplayOn();
+        enterDisplayOn(*startupBl);
     }
 
     std::vector<struct pollfd> pollfds;
@@ -317,8 +452,20 @@ void RawLightNotifier::notify() {
                     // Recover if POWER_ON fired before event registration at boot;
                     // the 5.10 driver suppresses MI_DISP_EVENT_51_BRIGHTNESS during AOD.
                     if (!wantDisplayOn && !powerEventSeen && bklRaw > 0) {
-                        enterDisplayOn();
+                        enterDisplayOn(bklRaw);
                     }
+                    break;
+                }
+                updateBacklight(bklRaw);
+                break;
+            }
+            case MI_DISP_EVENT_DC: {
+                int32_t dcVal = 0;
+                if (!readDispPayload(*response, payloadLength, &dcVal)) {
+                    continue;
+                }
+                if (mCompensator != nullptr) {
+                    mCompensator->setDcMode(dcVal != 0);
                 }
                 break;
             }
