@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2024 The LineageOS Project
+// Copyright (C) 2024, 2026 The LineageOS Project
 //
 // SPDX-License-Identifier: Apache-2.0
 //
@@ -30,7 +30,37 @@ cc_binary {
         "libhidlbase",
         "libutils",
         "android.frameworks.sensorservice@1.0",
-    ],
+    ] + select(soong_config_variable("xiaomi_sm8450_sensor_notifier", "extension_lib"), {
+        "libsensor-notifier-ext-udals": [
+            "android.hardware.common-V2-ndk",
+            "libbinder_ndk",
+            "libcutils",
+            "libjsoncpp",
+            "libnativewindow",
+            "vendor.qti.hardware.display.config-V7-ndk",
+        ],
+        "//device/xiaomi/sm8450-common:libsensor-notifier-ext-udals": [
+            "android.hardware.common-V2-ndk",
+            "libbinder_ndk",
+            "libcutils",
+            "libjsoncpp",
+            "libnativewindow",
+            "vendor.qti.hardware.display.config-V7-ndk",
+        ],
+        default: [],
+    }),
+
+    static_libs: select(soong_config_variable("xiaomi_sm8450_sensor_notifier", "extension_lib"), {
+        "libsensor-notifier-ext-udals": [
+            "libaidlcommonsupport",
+            "libxiaomi-udals-model",
+        ],
+        "//device/xiaomi/sm8450-common:libsensor-notifier-ext-udals": [
+            "libaidlcommonsupport",
+            "libxiaomi-udals-model",
+        ],
+        default: [],
+    }),
 
     whole_static_libs: select(soong_config_variable("xiaomi_sm8450_sensor_notifier", "extension_lib"), {
         any @ extension_lib: [
@@ -61,5 +91,72 @@ cc_library_static {
 
     header_libs: [
         "xiaomi_sm8450_sensor_notifier_headers",
+    ],
+}
+
+cc_library_static {
+    name: "libxiaomi-udals-model",
+    vendor: true,
+    host_supported: true,
+    cpp_std: "gnu++20",
+
+    srcs: [
+        "udals/UDalsStockModel.cpp",
+    ],
+
+    shared_libs: [
+        "libjsoncpp",
+    ],
+
+    export_include_dirs: [
+        "udals",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-ffp-contract=off",
+    ],
+}
+
+cc_library_static {
+    name: "libsensor-notifier-ext-udals",
+    vendor: true,
+    cpp_std: "gnu++20",
+
+    srcs: [
+        "udals/CwbClient.cpp",
+        "udals/RawLightNotifier.cpp",
+        "udals/SensorNotifierExt.cpp",
+        "udals/UDalsBleedCompensator.cpp",
+    ],
+
+    shared_libs: [
+        "android.frameworks.sensorservice@1.0",
+        "android.hardware.common-V2-ndk",
+        "libbase",
+        "libbinder_ndk",
+        "libhidlbase",
+        "libjsoncpp",
+        "libnativewindow",
+        "libutils",
+        "vendor.qti.hardware.display.config-V7-ndk",
+    ],
+
+    static_libs: [
+        "libaidlcommonsupport",
+        "libxiaomi-udals-model",
+    ],
+
+    header_libs: [
+        "generated_kernel_headers",
+        "xiaomi_sm8450_sensor_notifier_headers",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
     ],
 }
