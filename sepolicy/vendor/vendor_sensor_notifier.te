@@ -22,6 +22,9 @@ allow vendor_sensor_notifier vendor_sysfs_graphics:dir search;
 allow vendor_sensor_notifier vendor_sysfs_graphics:file r_file_perms;
 allow vendor_sensor_notifier vendor_sysfs_graphics:lnk_file r_file_perms;
 
+allow vendor_sensor_notifier mnt_vendor_file:dir search;
+r_dir_file(vendor_sensor_notifier, vendor_persist_sensors_file)
+
 # for libssccalapi@2.0
 allow vendor_sensor_notifier self:{ socket qipcrtr_socket} create_socket_perms;
 allowxperm vendor_sensor_notifier self:{ socket qipcrtr_socket} ioctl msm_sock_ipc_ioctls;

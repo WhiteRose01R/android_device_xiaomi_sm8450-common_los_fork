@@ -18,13 +18,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <utility>
 
 namespace {
 
+constexpr const char* kPersistCaliPath = "/mnt/vendor/persist/sensors/lightSensorCali.json";
+constexpr float kMinPersistScale = 0.5f;
+constexpr float kMaxPersistScale = 2.0f;
 constexpr auto kWakeGateTimeout = std::chrono::milliseconds(250);
 constexpr auto kTransitionHoldTimeout = std::chrono::milliseconds(250);
 constexpr auto kBacklightRampDownHold = std::chrono::milliseconds(150);
@@ -54,6 +59,38 @@ bool parseCsvInts(const std::string& str, std::array<int, N>* out) {
         }
     }
     return true;
+}
+
+bool parseChannelScale(const Json::Value& value, std::array<float, 4>* out) {
+    if (value.isString()) {
+        auto parts = android::base::Split(value.asString(), ",");
+        if (parts.size() != 4) {
+            return false;
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            float v = 0.0f;
+            if (!android::base::ParseFloat(android::base::Trim(parts[i]), &v) ||
+                !std::isfinite(v) || v <= 0.0f) {
+                return false;
+            }
+            (*out)[i] = v;
+        }
+        return true;
+    }
+    if (value.isArray() && value.size() == 4) {
+        for (Json::ArrayIndex i = 0; i < 4; ++i) {
+            if (!value[i].isNumeric()) {
+                return false;
+            }
+            const float v = value[i].asFloat();
+            if (!std::isfinite(v) || v <= 0.0f) {
+                return false;
+            }
+            (*out)[i] = v;
+        }
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -167,20 +204,97 @@ bool UDalsBleedCompensator::loadConfig(const std::string& path, UdalsGeometry* o
         return !out->empty() && out->back().bleedLux > 0.0f;
     };
 
-    const auto peakBleed = *mPeakBleedLux;
-    auto loadCurves = [&parseCurve, &peakBleed](const Json::Value& obj, CurveSet* out) {
+    auto parseCurveSet = [&parseCurve](const Json::Value& obj, CurveSet* out,
+                                       std::array<uint8_t, 3>* outSources) {
         static constexpr std::array<const char*, 3> kKeys = {"data_r", "data_g", "data_b"};
         for (size_t c = 0; c < 3; ++c) {
             auto& curve = (*out)[c];
-            if (!parseCurve(obj[kKeys[c]], 1, &curve) &&
-                !parseCurve(obj["data_w"], c + 2, &curve) &&
-                !parseCurve(obj["data_w"], 1, &curve)) {
+            if (parseCurve(obj[kKeys[c]], 1, &curve)) {
+                (*outSources)[c] = 0;
+            } else if (parseCurve(obj["data_w"], c + 2, &curve)) {
+                (*outSources)[c] = 1;
+            } else if (parseCurve(obj["data_w"], 1, &curve)) {
+                (*outSources)[c] = 2;
+            } else {
                 return false;
             }
-            const float maxClear = curve.back().bleedLux;
-            for (auto& pt : curve) {
-                pt.bleedLux = (pt.bleedLux / maxClear) * peakBleed[c];
+        }
+        return true;
+    };
+
+    const auto peakBleed = *mPeakBleedLux;
+    auto scaleCurveSet = [&peakBleed](CurveSet* curves, const std::array<float, 3>& denoms) {
+        for (size_t c = 0; c < 3; ++c) {
+            for (auto& pt : (*curves)[c]) {
+                pt.bleedLux = (pt.bleedLux / denoms[c]) * peakBleed[c];
             }
+        }
+    };
+
+    auto applyPersistScaling = [&parseCurve](const Json::Value& oriObj,
+                                             const std::array<uint8_t, 3>& sources,
+                                             const Json::Value& persistObj,
+                                             const std::array<float, 4>& scale, CurveSet* curves,
+                                             std::array<float, 3>* outPeakScale) {
+        if (!persistObj.isObject()) {
+            return false;
+        }
+        const std::string oriOwner = oriObj["owner"].isString() ? oriObj["owner"].asString() : "";
+        const std::string persistOwner =
+                persistObj["owner"].isString() ? persistObj["owner"].asString() : "";
+        if (!oriOwner.empty() && !persistOwner.empty() && persistOwner != oriOwner) {
+            LOG(WARNING) << "Skipping per-unit calibration table: owner '" << persistOwner
+                         << "' does not match config owner '" << oriOwner << "'";
+            return false;
+        }
+
+        static constexpr std::array<const char*, 3> kKeys = {"data_r", "data_g", "data_b"};
+        CurveSet scaled = *curves;
+        std::array<float, 3> peakScale = {1.0f, 1.0f, 1.0f};
+        for (size_t c = 0; c < 3; ++c) {
+            std::vector<CaliPoint> oriRef;
+            std::vector<CaliPoint> persistRef;
+            size_t colIndex = 1;
+            bool matched = false;
+            if (sources[c] == 0 && parseCurve(oriObj[kKeys[c]], 1, &oriRef) &&
+                parseCurve(persistObj[kKeys[c]], 1, &persistRef)) {
+                colIndex = 1;
+                matched = true;
+            } else if (sources[c] <= 1 && parseCurve(oriObj["data_w"], c + 2, &oriRef) &&
+                       parseCurve(persistObj["data_w"], c + 2, &persistRef)) {
+                colIndex = c + 2;
+                matched = true;
+            } else if (parseCurve(oriObj["data_w"], 1, &oriRef) &&
+                       parseCurve(persistObj["data_w"], 1, &persistRef)) {
+                colIndex = 1;
+                matched = true;
+            }
+            if (!matched || persistRef.size() < 2 ||
+                persistRef.back().brightness < oriRef.back().brightness * 0.5f) {
+                LOG(WARNING) << "Incomplete per-unit calibration table; using unity calibration";
+                return false;
+            }
+
+            const float chScale = scale[colIndex - 1];
+            const float minB = persistRef.front().brightness;
+            const float maxB = persistRef.back().brightness;
+            float peakFactor = 1.0f;
+            for (auto& pt : scaled[c]) {
+                const float qb = std::clamp(pt.brightness, minB, maxB);
+                const float oriVal = interpolateTable(oriRef, qb);
+                const float persistVal = interpolateTable(persistRef, qb);
+                if (oriVal > 1e-4f && persistVal > 0.0f) {
+                    const float factor = std::clamp((persistVal / oriVal) * chScale,
+                                                    kMinPersistScale, kMaxPersistScale);
+                    pt.bleedLux *= factor;
+                    peakFactor = factor;
+                }
+            }
+            peakScale[c] = peakFactor;
+        }
+        *curves = std::move(scaled);
+        if (outPeakScale != nullptr) {
+            *outPeakScale = peakScale;
         }
         return true;
     };
@@ -192,9 +306,57 @@ bool UDalsBleedCompensator::loadConfig(const std::string& path, UdalsGeometry* o
 
     const auto& norm = als["panel_Info_cali_ori"];
     CurveSet normalCurves{};
-    if (!loadCurves(norm, &normalCurves)) {
+    std::array<uint8_t, 3> normalSources{};
+    if (!parseCurveSet(norm, &normalCurves, &normalSources)) {
         LOG(ERROR) << "Failed to parse panel_Info_cali_ori tables";
         return false;
+    }
+
+    const std::array<float, 3> normalMaxClear = {
+            normalCurves[0].back().bleedLux,
+            normalCurves[1].back().bleedLux,
+            normalCurves[2].back().bleedLux,
+    };
+    scaleCurveSet(&normalCurves, normalMaxClear);
+
+    std::array<float, 3> persistPeakScale = {1.0f, 1.0f, 1.0f};
+    bool persistApplied = false;
+    {
+        errno = 0;
+        std::string persistContent;
+        if (android::base::ReadFileToString(kPersistCaliPath, &persistContent)) {
+            Json::Value persistRoot;
+            Json::CharReaderBuilder persistBuilder;
+            std::unique_ptr<Json::CharReader> persistReader(persistBuilder.newCharReader());
+            std::string persistErrs;
+            if (persistReader->parse(persistContent.data(),
+                                     persistContent.data() + persistContent.size(), &persistRoot,
+                                     &persistErrs) &&
+                persistRoot.isObject() && persistRoot["Als"].isObject()) {
+                const auto& pAls = persistRoot["Als"];
+                std::array<float, 4> channelScale = {1.0f, 1.0f, 1.0f, 1.0f};
+                bool scaleOk = true;
+                if (pAls.isMember("channel_scale")) {
+                    scaleOk = pAls["channel_scale"].isObject() &&
+                              parseChannelScale(pAls["channel_scale"]["scale_data"], &channelScale);
+                }
+                if (scaleOk) {
+                    persistApplied =
+                            applyPersistScaling(norm, normalSources, pAls["panel_Info_cali"],
+                                                channelScale, &normalCurves, &persistPeakScale);
+                } else {
+                    LOG(WARNING) << "Invalid channel_scale in " << kPersistCaliPath
+                                 << "; using unity calibration";
+                }
+            } else {
+                LOG(WARNING) << "Failed to parse per-unit calibration " << kPersistCaliPath
+                             << (persistErrs.empty() ? "" : (": " + persistErrs))
+                             << "; using unity calibration";
+            }
+        } else if (errno != ENOENT && errno != 0) {
+            LOG(WARNING) << "Cannot read per-unit calibration " << kPersistCaliPath << ": "
+                         << std::strerror(errno) << "; using unity calibration";
+        }
     }
 
     const float maxBkl = std::max({
@@ -215,9 +377,17 @@ bool UDalsBleedCompensator::loadConfig(const std::string& path, UdalsGeometry* o
     }
     *outGeo = geo;
 
-    LOG(INFO) << "Loaded UDALS calibration: ROI=[" << geo.left << "," << geo.top << "," << geo.right
-              << "," << geo.bottom << "] radii=[" << geo.r1 << "," << geo.r2 << "," << geo.r3
-              << "] maxBkl=" << normalMaxBkl;
+    if (persistApplied) {
+        LOG(INFO) << "Loaded UDALS calibration: ROI=[" << geo.left << "," << geo.top << ","
+                  << geo.right << "," << geo.bottom << "] radii=[" << geo.r1 << "," << geo.r2 << ","
+                  << geo.r3 << "] maxBkl=" << normalMaxBkl << " persistScale=["
+                  << persistPeakScale[0] << "," << persistPeakScale[1] << "," << persistPeakScale[2]
+                  << "]";
+    } else {
+        LOG(INFO) << "Loaded UDALS calibration: ROI=[" << geo.left << "," << geo.top << ","
+                  << geo.right << "," << geo.bottom << "] radii=[" << geo.r1 << "," << geo.r2 << ","
+                  << geo.r3 << "] maxBkl=" << normalMaxBkl;
+    }
 
     return true;
 }
@@ -428,7 +598,7 @@ float UDalsBleedCompensator::calculateBleedLuxForRgbLocked(uint32_t backlight,
 
     float totalBleed = 0.0f;
     for (size_t c = 0; c < 3; ++c) {
-        const float channelBleed = isHbm ? hbmScale * (*mPeakBleedLux)[c]
+        const float channelBleed = isHbm ? hbmScale * mNormalCurves[c].back().bleedLux
                                          : interpolateTable(mNormalCurves[c], bklFloat);
         totalBleed += rgb[c] * channelBleed;
     }
